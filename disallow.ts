@@ -33,7 +33,8 @@ function defaultAgentDir(): string {
 /**
  * Parse the package name out of an npm spec. Port of pi-subagents'
  * `parseNpmPackageName`: keeps `@scope`, drops `@version`, lowercases. The
- * caller strips the `npm:` prefix. Returns undefined if unparseable.
+ * caller strips the `npm:` prefix. Returns the lowercased input when the regex
+ * does not match (empty input yields undefined).
  *
  *   pkg                  -> pkg
  *   pkg@2.0              -> pkg
@@ -62,11 +63,19 @@ export function parseNpmName(spec: string): string | undefined {
  * URLs/paths are lowercased verbatim — parseNpmName would mis-split an SSH
  * URL's `@host` as a version. Bare package names (incl. @scope/versioned) are
  * parsed so a user can write `@scope/pkg@2.0` to match `npm:@scope/pkg`.
+ * The guard catches `git:`/`file:`/scheme-bearing (`://`) AND bare SSH forms
+ * (`git@github.com:user/repo`) so they pass through verbatim rather than
+ * collapsing to `git` (which could spuriously match a package named `git`).
  */
 export function normalizeForMatch(entry: string): string {
   let s = entry.trim();
   if (s.startsWith("npm:")) s = s.slice(4).trim();
-  if (s.startsWith("git:") || s.startsWith("file:") || s.includes("://")) {
+  if (
+    s.startsWith("git:") ||
+    s.startsWith("file:") ||
+    s.includes("://") ||
+    /^[^/\s]+@[^:\s]+:/.test(s) // bare SSH: git@github.com:user/repo
+  ) {
     return s.toLowerCase();
   }
   // Bare package name (possibly @scope/versioned): strip @version, keep @scope.
@@ -177,17 +186,23 @@ function readSettingsPackages(settingsPath: string): string[] {
 
 /**
  * Enumerate every extension a full-mode child would load: global-local +
- * project-local (discovered) + `settings.json["packages"]`. Each `entry` is
- * `-e`-ready (npm:/git: spec verbatim, or resolved local file path); each
- * `key` is the normalized match key. Dedup by resolved entry path.
+ * project-local (discovered) + `packages` from BOTH the global
+ * (`<agentDir>/settings.json`) and project (`<cwd>/.pi/settings.json`)
+ * settings. pi's `package-manager.resolve()` reads both (project first), so
+ * omitting project packages would silently drop them when `--no-extensions`
+ * is active. Each `entry` is `-e`-ready (npm:/git: spec verbatim, or resolved
+ * local file path); each `key` is the normalized match key. Dedup by resolved
+ * entry path.
  */
 export function loadDeclaredExtensions(
   cwd: string,
-  opts: { agentDir?: string; settingsPath?: string } = {},
+  opts: { agentDir?: string; settingsPath?: string; projectSettingsPath?: string } = {},
 ): DeclaredExt[] {
-  const globalExtDir = path.join(opts.agentDir ?? defaultAgentDir(), "extensions");
+  const agentDir = opts.agentDir ?? defaultAgentDir();
+  const globalExtDir = path.join(agentDir, "extensions");
   const localExtDir = path.join(cwd, ".pi", "extensions");
-  const settingsPath = opts.settingsPath ?? path.join(defaultAgentDir(), "settings.json");
+  const globalSettingsPath = opts.settingsPath ?? path.join(agentDir, "settings.json");
+  const projectSettingsPath = opts.projectSettingsPath ?? path.join(cwd, ".pi", "settings.json");
 
   const out: DeclaredExt[] = [];
   const seen = new Set<string>();
@@ -201,7 +216,10 @@ export function loadDeclaredExtensions(
 
   for (const d of discoverInExtDir(globalExtDir)) push(d);
   for (const d of discoverInExtDir(localExtDir)) push(d);
-  for (const spec of readSettingsPackages(settingsPath)) {
+  for (const spec of readSettingsPackages(globalSettingsPath)) {
+    push({ entry: spec, key: normalizeForMatch(spec) });
+  }
+  for (const spec of readSettingsPackages(projectSettingsPath)) {
     push({ entry: spec, key: normalizeForMatch(spec) });
   }
   return out;

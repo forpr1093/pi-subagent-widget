@@ -110,6 +110,51 @@ test("filterSurvivors blocks a local extension by dir-basename key", () => {
   assert.deepEqual(survivors, ["/home/u/.pi/agent/extensions/subagent-widget/index.ts"]);
 });
 
+test("normalizeForMatch does not collapse bare SSH URLs to \"git\"", () => {
+  // Without the SSH guard, parseNpmName would split at the first @ and return "git".
+  assert.equal(normalizeForMatch("git@github.com:user/repo"), "git@github.com:user/repo");
+  // A package literally named "git" must NOT be matched by a bare SSH disallow entry.
+  const declared: DeclaredExt[] = [{ entry: "npm:git", key: "git" }];
+  assert.equal(filterSurvivors(declared, ["git@github.com:user/repo"]), null);
+});
+
+test("loadDeclaredExtensions reads packages from BOTH global and project settings", async () => {
+  // Regression guard for the silent-drop bug: pi's package-manager reads
+  // <cwd>/.pi/settings.json packages; the enumeration must too.
+  const os = await import("node:os");
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "disallow-test-"));
+  const agentDir = path.join(tmp, "agent");
+  const projectDir = path.join(tmp, "project");
+  const extDir = path.join(agentDir, "extensions", "my-local-ext");
+  fs.mkdirSync(extDir, { recursive: true });
+  fs.writeFileSync(path.join(extDir, "index.ts"), "export default function(){}");
+  fs.mkdirSync(path.join(agentDir), { recursive: true });
+  fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({
+    packages: ["npm:global-pkg"],
+  }));
+  fs.mkdirSync(path.join(projectDir, ".pi"), { recursive: true });
+  fs.writeFileSync(path.join(projectDir, ".pi", "settings.json"), JSON.stringify({
+    packages: ["npm:project-pkg"],
+  }));
+
+  const { loadDeclaredExtensions } = await import("../disallow.ts");
+  const declared = loadDeclaredExtensions(projectDir, { agentDir });
+  const keys = declared.map((d) => d.key).sort();
+  assert.ok(keys.includes("global-pkg"), "global settings package enumerated");
+  assert.ok(keys.includes("project-pkg"), "PROJECT settings package enumerated (D1 fix)");
+  assert.ok(keys.includes("my-local-ext"), "local auto-discovered extension enumerated");
+
+  // All three must survive when disallowing only the project package.
+  const survivors = filterSurvivors(declared, ["project-pkg"]);
+  assert.ok(survivors !== null);
+  assert.ok(!survivors.some((e) => e === "npm:project-pkg"), "project-pkg blocked");
+  assert.ok(survivors.some((e) => e === "npm:global-pkg"), "global-pkg preserved (not dropped)");
+
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
 test("filterSurvivors does not mutate the declared input", () => {
   const declared: DeclaredExt[] = [
     { entry: "npm:pkg-a", key: "pkg-a" },

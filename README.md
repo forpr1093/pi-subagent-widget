@@ -67,10 +67,20 @@ so the disallowed extension never loads. When the list is empty or matches
 nothing (e.g. a stale/typo entry), **no extension flags are injected** and pi's
 normal discovery runs untouched: zero behavior change in the common case.
 
-The survivor list faithfully reproduces what the child would have loaded —
-**all three discovery sources** (global-local `~/.pi/agent/extensions/*/`,
-project-local `.pi/extensions/*/`, and `settings.json["packages"]`) minus only
-the disallowed entries. No silent drops of currently-loaded extensions.
+The survivor list reproduces what the child would have loaded across the
+standard discovery sources — global-local (`~/.pi/agent/extensions/*/`),
+project-local (`.pi/extensions/*/`), and `packages` from both the global
+(`<agentDir>/settings.json`) and project (`<cwd>/.pi/settings.json`) settings —
+minus only the disallowed entries. This is a faithful port of the per-directory
+logic in pi's `package-manager`/`resource-loader`; no blockable extension that
+the child would discover is silently dropped.
+
+Residual gaps are **over-inclusion, never drops**: pi applies root-self-checks,
+`.gitignore`, dotfile, and `node_modules` skips during auto-discovery that this
+enumeration does not. In practice these only matter if an auto-discovery dir
+contains a stray `node_modules/` or root `package.json`, in which case the
+child would load an *extra* extension, not lose one. The parent process's own
+CLI `-e` extensions are not forwarded to the child today either way.
 
 ### Matching (strict)
 
@@ -100,9 +110,12 @@ never frozen across turns).
   block an extension in lite, remove it from `liteAllowedExt`.
 - The parent process's own CLI `-e` extensions are not forwarded to the child
   today, so they are not blockable here (not a regression).
-- Discovery mirrors pi 0.80.x (`loader.js` `discoverAndLoadExtensions`):
-  global-local + project-local + `settings.json["packages"]`. If pi adds a
-  fourth source in future, disallowed entries there won't be reachable.
+- Discovery mirrors pi's runtime (`package-manager.resolve()` +
+  `resource-loader.getExtensions()`): global + project auto-discovered dirs,
+  and `packages` from both global and project `settings.json`. It does not
+  replicate the root-self-check / `.gitignore` / dotfile / `node_modules`
+  skips (over-inclusion only — see above). If pi adds a further discovery
+  source in future, disallowed entries there won't be reachable.
 
 ## Session file cleanup
 
