@@ -1,11 +1,14 @@
-// Lite-subagent extension allow-list.
+// Extension allow-/disallow-lists read from the sidecar config.json.
 //
-// Sidecar JSON (sibling of this directory's index.ts) lists extension names
-// passed to `pi -e` for lite subagents. Read fresh on every lite spawn, so
-// edits take effect immediately (no /reload).
+// `liteAllowedExt` (existing): the allow-list for lite subagents — each entry is
+// passed to `pi -e` after `--no-extensions`. Read fresh on every lite spawn.
+// `disallowedExt` (new): the disallow-list for FULL subagents — when non-empty
+// and matching ≥1 declared extension, the spawn is sandboxed to the survivors
+// via `--no-extensions -e <each>`; otherwise no flags and pi discovers all.
+// See disallow.ts and PLAN-disallow-list.md.
 //
-// Format: ["npm:pi-neuralwatt-provider", ...] under "liteAllowedExt", or a bare
-// array. Entries are any form `pi -e` accepts (npm:, git:, or file/dir paths).
+// Format: ["npm:pi-neuralwatt-provider", ...] under each key, or a bare array.
+// Entries are any form `pi -e` accepts (npm:, git:, or file/dir paths).
 import * as fs from "fs";
 import * as path from "path";
 
@@ -22,4 +25,16 @@ export function loadLiteExtensions(): string[] {
     }
   } catch {}
   return ["npm:pi-neuralwatt-provider"]; // fallback if missing/invalid
+}
+
+// Disallow-list for full-mode subagents. Empty fallback = no-op (pi discovers
+// all extensions). Read fresh on every full spawn, including /subcont.
+export function loadDisallowedExtensions(): string[] {
+  try {
+    const raw = JSON.parse(fs.readFileSync(getLiteConfigPath(), "utf8"));
+    if (raw && typeof raw === "object" && Array.isArray(raw.disallowedExt)) {
+      return raw.disallowedExt.filter((e: any) => typeof e === "string");
+    }
+  } catch {}
+  return []; // no-op fallback — pi's normal discovery runs untouched
 }

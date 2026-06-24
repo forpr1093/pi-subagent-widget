@@ -47,6 +47,7 @@ import {
 } from "./inspector.ts";
 import { deleteSessionFile, makeSessionFile } from "./session.ts";
 import { loadLiteExtensions } from "./config.ts";
+import { resolveFullModeExtArgs } from "./disallow.ts";
 import { buildSubagentWidget } from "./widget.ts";
 
 export default function (pi: ExtensionAPI) {
@@ -126,8 +127,17 @@ export default function (pi: ExtensionAPI) {
       args.push("--no-extensions", "--no-skills");
       for (const e of entries) args.push("-e", e);
       args.push("--tools", "read,bash,grep,find,ls", "--thinking", "off");
+    } else {
+      // Full mode: let pi discover all extensions unless the disallow list
+      // (config.json `disallowedExt`) actually matches — then sandbox to the
+      // survivors via --no-extensions -e. No match (empty/stale list) → no
+      // flags, normal discovery (criterion b, see disallow.ts).
+      const extArgs = resolveFullModeExtArgs(process.cwd());
+      if (extArgs) {
+        args.push("--no-extensions");
+        for (const e of extArgs) args.push("-e", e);
+      }
     }
-    // else: extensions enabled by default, full toolset, default thinking, default model.
 
     args.push(prompt);
 

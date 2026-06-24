@@ -48,6 +48,62 @@ The main agent also has matching tools: `subagent_create` (with a `lite` paramet
 
 Entries are any form `pi -e` accepts: `npm:<package>`, `npm:<package>@<version>`, `git:...`, or an absolute file/directory path. Edits take effect on the next spawn — no `/reload` needed (the file is read fresh every time a lite subagent spawns). If the file is missing or invalid, the fallback is `["npm:pi-neuralwatt-provider"]`.
 
+## Configuring disallowed extensions
+
+`config.json` lists extension names under `disallowedExt` that are **blocked
+from loading in full-mode subagents** (`/sub`, `lite=false`). Lite subagents are
+unaffected — they stay governed by `liteAllowedExt`.
+
+```json
+{
+  "liteAllowedExt": ["npm:pi-neuralwatt-provider"],
+  "disallowedExt": ["@gotgenes/pi-permission-system"]
+}
+```
+
+When the list is **non-empty and matches at least one declared extension**, the
+full subagent is sandboxed to the survivors via `--no-extensions -e <each>` —
+so the disallowed extension never loads. When the list is empty or matches
+nothing (e.g. a stale/typo entry), **no extension flags are injected** and pi's
+normal discovery runs untouched: zero behavior change in the common case.
+
+The survivor list faithfully reproduces what the child would have loaded —
+**all three discovery sources** (global-local `~/.pi/agent/extensions/*/`,
+project-local `.pi/extensions/*/`, and `settings.json["packages"]`) minus only
+the disallowed entries. No silent drops of currently-loaded extensions.
+
+### Matching (strict)
+
+Entries are normalized before comparison: strip the `npm:` prefix and any
+`@<version>`, keep `@scope`, lowercase. To block a **scoped** package you must
+write the scope — a bare name will **not** match.
+
+| Disallow entry | Declared entry | Match? |
+|---|---|---|
+| `@gotgenes/pi-permission-system` | `npm:@gotgenes/pi-permission-system` | ✅ |
+| `@gotgenes/pi-permission-system` | `npm:@gotgenes/pi-permission-system@2.0` | ✅ (version dropped) |
+| `npm:@gotgenes/pi-permission-system` | `npm:@gotgenes/pi-permission-system` | ✅ (`npm:` prefix optional) |
+| `pi-permission-system` (bare) | `npm:@gotgenes/pi-permission-system` (scoped) | ❌ no match |
+| `pi-rtk-optimizer` | `npm:pi-rtk-optimizer` | ✅ |
+| `subagent-widget` | `~/.pi/agent/extensions/subagent-widget/index.ts` | ✅ (local dir basename) |
+
+Local (auto-discovered) extensions are matched by their directory name (or the
+file name without extension, for direct `extensions/*.ts` files).
+
+The list is read fresh on every spawn, so edits take effect immediately — no
+`/reload` needed — including on `/subcont` continuations (the disallow state is
+never frozen across turns).
+
+### Scope & limits
+
+- **Full mode only.** Lite mode keeps its own `liteAllowedExt` allow-list; to
+  block an extension in lite, remove it from `liteAllowedExt`.
+- The parent process's own CLI `-e` extensions are not forwarded to the child
+  today, so they are not blockable here (not a regression).
+- Discovery mirrors pi 0.80.x (`loader.js` `discoverAndLoadExtensions`):
+  global-local + project-local + `settings.json["packages"]`. If pi adds a
+  fourth source in future, disallowed entries there won't be reachable.
+
 ## Session file cleanup
 
 Each subagent writes its conversation to a JSONL file under `~/.pi/agent/sessions/subagents/`. These files are deleted when the subagent is removed (`/subrm`, `/subclear`, `subagent_remove`, or on `session_start`/resume). Subagents that finish naturally keep their file (so `/subcont` works mid-session) until explicitly removed.
@@ -99,11 +155,15 @@ pauses auto-follow until you jump back to the bottom (`G`/`End`).
 `/subinspect` after a `/subcont` resets to the new turn. Prior turns' full
 transcripts remain on disk in the session file at the path shown in the widget.
 
-## Feature 2 (deferred)
+## Feature 2 (disallow-list — implemented)
 
-A per-subagent extension exclude-list (e.g. to exclude `pi-permission-system` from
-full subagents) is **not implemented**. pi has no `--exclude-extensions` flag and
-no per-invocation settings override; the `extensions` settings array only
-excludes paths you've added there, not auto-discovered/`packages`-sourced
-extensions, and `pi config` disables them globally (not per-subagent). Deferred
-until pi adds a per-process exclusion flag or mechanism.
+A per-subagent extension **disallow-list** for full-mode subagents is
+implemented via [Configuring disallowed extensions](#configuring-disallowed-extensions).
+
+pi has no `--exclude-extensions` flag, so the disallow effect is achieved by
+enumerating every extension the child would load (all three discovery sources),
+subtracting the disallowed entries, and spawning the child with
+`--no-extensions -e <each survivor>`. Because the enumeration is faithful to
+pi's own discovery, no currently-loaded extension is silently dropped — only
+the disallowed ones are omitted. Lifted only when the list actually matches
+(criterion b), so an empty/stale list is a true no-op.
