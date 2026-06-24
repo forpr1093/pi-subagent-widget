@@ -20,6 +20,8 @@ export type InspectorEvent =
       done: boolean;
     };
 
+export type SubagentOrigin = "user" | "agent";
+
 export interface SubState {
   id: number;
   status: "running" | "done" | "error";
@@ -30,5 +32,6 @@ export interface SubState {
   sessionFile: string; // persistent JSONL session path — used by /subcont to resume
   turnCount: number; // increments each time /subcont continues this agent
   lite: boolean; // whether this agent runs in lite mode (restricted tools, no thinking)
+  origin: SubagentOrigin; // who initiated this subagent: "user" (/sub slash) or "agent" (subagent_create tool)
   proc?: any; // active ChildProcess ref (for kill on /subrm)
 }

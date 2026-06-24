@@ -38,7 +38,7 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { spawn } from "node:child_process";
-import type { InspectorEvent, SubState } from "./types.ts";
+import type { InspectorEvent, SubState, SubagentOrigin } from "./types.ts";
 import {
   appendText,
   cap,
@@ -202,7 +202,7 @@ export default function (pi: ExtensionAPI) {
         pi.sendMessage(
           {
             customType: "subagent-result",
-            content: `Subagent #${state.id}${state.lite ? " (⚡lite)" : ""}${state.turnCount > 1 ? ` (Turn ${state.turnCount})` : ""} finished "${prompt}" in ${Math.round(state.elapsed / 1000)}s.\n\nResult:\n${result.slice(0, 8000)}${result.length > 8000 ? "\n\n... [truncated]" : ""}`,
+            content: `Subagent #${state.id}${state.lite ? " (⚡lite)" : ""}${state.origin === "user" ? " (User Spawned)" : ""}${state.turnCount > 1 ? ` (Turn ${state.turnCount})` : ""} finished "${prompt}" in ${Math.round(state.elapsed / 1000)}s.\n\nResult:\n${result.slice(0, 8000)}${result.length > 8000 ? "\n\n... [truncated]" : ""}`,
             display: true,
           },
           { deliverAs: "followUp", triggerTurn: true },
@@ -252,6 +252,7 @@ Modes (via the 'lite' parameter):
         sessionFile: makeSessionFile(id),
         turnCount: 1,
         lite,
+        origin: "agent",
       };
       agents.set(id, state);
       updateWidgets();
@@ -431,6 +432,7 @@ Modes (via the 'lite' parameter):
         sessionFile: makeSessionFile(id),
         turnCount: 1,
         lite: false,
+        origin: "user",
       };
       agents.set(id, state);
       updateWidgets();
@@ -460,6 +462,7 @@ Modes (via the 'lite' parameter):
         sessionFile: makeSessionFile(id),
         turnCount: 1,
         lite: true,
+        origin: "user",
       };
       agents.set(id, state);
       updateWidgets();
