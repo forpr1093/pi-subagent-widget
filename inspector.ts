@@ -106,6 +106,17 @@ export function buildInspectorLines(
   const out: string[] = [];
   const push = (s: string, color?: string) =>
     out.push(color ? theme.fg(color, s) : s);
+  // The prompt the subagent received this turn. state.task already holds the
+  // {previous}/{input}-substituted task (reset alongside state.events on
+  // /subcont, so it always matches the events below). Surfacing it here makes
+  // auto-advance + chain handoffs visible without scrolling the response.
+  if (state.task.trim()) {
+    push("prompt:", "accent");
+    for (const raw of state.task.split("\n")) {
+      for (const wl of wrapLine(raw, innerW - 2)) push("  " + wl, "dim");
+    }
+    push("");
+  }
   for (const ev of state.events) {
     if (ev.kind === "text") {
       let prevBlank = false;
@@ -140,6 +151,46 @@ export function buildInspectorLines(
     }
   }
   return out;
+}
+
+// Plain-text transcript for the agent-facing `subagent_inspect` TOOL (not the
+// /subinspect COMMAND, which opens a live TUI panel). The tool returns this so
+// the agent can reason over what a subagent received + did — the panel the
+// command opens is unreadable to the model. Mirrors buildInspectorLines but as
+// transport text: no theme/ANSI, no viewport-width wrapping (the model reads full
+// lines). Assistant text is FULL; tool args/results use displayField (bounded).
+export function transcriptText(state: SubState): string {
+  const lines: string[] = [];
+  const toolCount = state.events.filter((e) => e.kind === "tool").length;
+  lines.push(
+    `subagent #${state.id} [${state.status}]${state.lite ? " lite" : ""} · turn ${state.turnCount} · ${Math.round(state.elapsed / 1000)}s · ${toolCount} tool${toolCount === 1 ? "" : "s"}`,
+  );
+  if (state.task.trim()) {
+    lines.push("task:");
+    for (const raw of state.task.split("\n")) lines.push("  " + raw);
+    lines.push("");
+  }
+  if (state.events.length === 0) {
+    lines.push("(no events yet)");
+  } else {
+    for (const ev of state.events) {
+      if (ev.kind === "text") {
+        lines.push("assistant:");
+        for (const raw of ev.text.split("\n")) lines.push("  " + raw);
+        lines.push("");
+      } else {
+        const mark = ev.done ? (ev.isError ? " ✗" : " ✓") : " …";
+        lines.push(`▸ ${ev.toolName}${mark}`);
+        if (ev.args) lines.push(`  args: ${displayField(ev.args)}`);
+        if (ev.done && ev.result)
+          lines.push(`  → ${displayField(ev.result)}`);
+        else if (!ev.done && ev.partial)
+          lines.push(`  ⋯ ${displayField(ev.partial)}`);
+        lines.push("");
+      }
+    }
+  }
+  return lines.join("\n");
 }
 
 // Plain box-drawing line filler. Built from plain chars (no ANSI) so the

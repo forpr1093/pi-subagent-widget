@@ -10,9 +10,14 @@ A pi extension that spawns background subagents with live stacking widgets.
 | `inspector.ts` | Floating read-only inspector overlay + event-shaping helpers (`cap`, `stringifyVal`, `appendText`, `wrapLine`, `buildInspectorLines`, `InspectorComponent`, `openInspector`). |
 | `widget.ts` | Compact stacked per-agent widget factory (`buildSubagentWidget`). |
 | `session.ts` | JSONL session-file make/delete helpers. |
-| `config.ts` | Lite-extension allow-list loader (`loadLiteExtensions`). |
-| `types.ts` | Shared types: `SubState`, `InspectorEvent`. |
-| `config.json` | List of extension names that lite subagents may load. |
+| `config.ts` | Config loaders: lite-extension allow-list (`loadLiteExtensions`), full-mode disallow-list (`loadDisallowedExtensions`), worktree mode (`loadWorktreeMode`). |
+| `disallow.ts` | Full-mode extension disallow-list resolution (survivor enumeration, `filterSurvivors`, `resolveFullModeExtArgs`). |
+| `agents.ts` | Named-agent discovery (`discoverAgents`) + `AgentConfig` schema + spawn-flag overlay (`agentConfigFlags`). |
+| `chains.ts` | Chain-template discovery (`discoverChains`) via pi's bundled `parseFrontmatter` (full YAML). |
+| `worktree.ts` | Git worktree isolation (`createWorktree`/`removeWorktree`) — §12. |
+| `types.ts` | Shared types: `SubState`, `ChainState`, `InspectorEvent`. |
+| `config.json` | `liteAllowedExt`, `disallowedExt`, `worktree` settings. |
+| `docs/SPEC-orchestration.md` | Locked design spec for orchestration (decisions, schemas, §11 research, §12 worktree). |
 | `README.md` | This file. |
 
 Pure/testable modules (`inspector`, `widget`, `session`, `config`, `types`) hold no
@@ -26,9 +31,12 @@ use `.ts` extensions, matching pi's own source style and the jiti loader.
 | `/sub <task>` | Spawn a **full** subagent (all extensions, default tools/thinking/model). |
 | `/sublite <task>` | Spawn a **lite** subagent (only `config.json` extensions, restricted tools `read,bash,grep,find,ls`, thinking off). |
 | `/subcont <id> <prompt>` | Continue subagent `#<id>`'s conversation (preserves its lite/full mode). |
-| `/subrm <id>` | Remove subagent `#<id>` — kills process, removes widget, deletes its JSONL session file. |
-| `/subclear` | Clear all subagents (same cleanup as `/subrm` for each). |
-| `/subinspect [id]` | Open a floating, read-only, live-updating **inspector** for subagent `#<id>`. With no `id`, shows a picker of current subagents. See [Inspector](#inspector) below. |
+| `/subrm <#N\|CN\|CN@step>` | Remove a subagent (`#N`) or whole chain (`CN`); `CN@step` for one step of a **done** chain (guarded if live). |
+| `/subclear` | Clear all subagents **and** chains (kills running, force-removes worktrees). |
+| `/subinspect [#N\|CN\|CN@2]` | Open the floating inspector for `#N`, or list a chain's steps (`CN`) and drill into one. |
+| `/sublist` | List all subagents (`#N`) and chains (`Ck · step i/N · agent`). |
+| `/subchain <template> [input]` | Run a named chain template (or `agent "task" \| agent "task"` to compose on-demand; no args = picker). |
+| `/subchain-doctor` | Read-only diagnostics: resolved agent/chain dirs, discovery counts, extensions survival (neuralwatt). |
 
 The main agent also has matching tools: `subagent_create` (with a `lite` parameter), `subagent_continue`, `subagent_remove`, `subagent_list`, `subagent_inspect`.
 
@@ -54,6 +62,14 @@ Entries are any form `pi -e` accepts: `npm:<package>`, `npm:<package>@<version>`
 from loading in full-mode subagents** (`/sub`, `lite=false`). Lite subagents are
 unaffected — they stay governed by `liteAllowedExt`.
 
+> **Built-in default (code level, not config):** `subagent-widget` itself is
+> **always excluded** from full-mode subagents regardless of this list, so a
+> spawned subagent can't recursively spawn further subagents via this widget's
+> own tools (`subagent_create`, `subagent_continue`, …). It's hardcoded in
+> `disallow.ts` as `DEFAULT_DISALLOWED_EXT` and merged with your `disallowedExt`
+> on every spawn. You don't need to (and can't disable this by editing)
+> config.json for this entry; `disallowedExt` only adds *more* exclusions on top.
+
 ```json
 {
   "liteAllowedExt": ["npm:pi-neuralwatt-provider"],
@@ -61,11 +77,15 @@ unaffected — they stay governed by `liteAllowedExt`.
 }
 ```
 
-When the list is **non-empty and matches at least one declared extension**, the
-full subagent is sandboxed to the survivors via `--no-extensions -e <each>` —
-so the disallowed extension never loads. When the list is empty or matches
-nothing (e.g. a stale/typo entry), **no extension flags are injected** and pi's
-normal discovery runs untouched: zero behavior change in the common case.
+The effective disallow list is the built-in default **plus** your `disallowedExt`.
+When it matches at least one declared extension, the full subagent is sandboxed
+to the survivors via `--no-extensions -e <each>` — so those extensions never
+load. Because `subagent-widget` is always in the default list and is always
+among the discovered extensions while the widget is running, a full-mode spawn
+**always** injects `--no-extensions -e <survivors>` (it never discovers the
+widget in the child). The user list is still gated by matching (criterion b):
+a stale/typo `disallowedExt` entry that matches nothing drops nothing beyond the
+built-in default.
 
 The survivor list reproduces what the child would have loaded across the
 standard discovery sources — global-local (`~/.pi/agent/extensions/*/`),
@@ -141,7 +161,7 @@ subagent's **current turn**, the live flow the small widget can't fit:
 Open with `/subinspect <id>` (direct) or `/subinspect` (picker over current
 subagents). The overlay stays open and live-updates as events stream in; works on
 running **and** finished subagents (so you can review how it got its result).
-See `SPEC-inspector.md` for the locked decisions (dataset model, scroll
+See `docs/SPEC-inspector.md` for the locked decisions (dataset model, scroll
 behavior, optional-spec). Requires TUI mode (the picker falls back to
 `/subinspect <id>` in print/json mode).
 
@@ -180,3 +200,97 @@ subtracting the disallowed entries, and spawning the child with
 pi's own discovery, no currently-loaded extension is silently dropped — only
 the disallowed ones are omitted. Lifted only when the list actually matches
 (criterion b), so an empty/stale list is a true no-op.
+
+## Orchestration (named agents, chains, multi-agent workflows)
+
+Three execution modes (full design: [`docs/SPEC-orchestration.md`](./docs/SPEC-orchestration.md)):
+
+1. **Mode 1 (preserved)** — the main agent calls `subagent_create`/`subagent_continue`
+   sequentially, reads each follow-up, decides the next call. Zero new tools.
+2. **Mode 2 (`orchestrate` tool + `/subchain`)** — a multi-agent **chain** runs in the
+   background with **auto-advance** (each step's output spliced into the next's
+   `{previous}` placeholder) and one aggregate follow-up on completion. Fire-and-forget.
+3. **Discovery (`subagent_catalog`)** — O(1) lookup of available agents + chains
+   (name + description only; no roster injection into tool descriptions).
+
+### Named agents (`~/.pi/agent/agents/*.md`)
+
+Markdown files with YAML frontmatter. `name` + `description` required; the body
+is the agent's system prompt.
+
+```markdown
+---
+name: scout
+description: Fast codebase recon — map files, entry points, and structure.
+tools: read, grep, find, ls, bash            # allowlist → --tools (optional)
+disallowedTools: edit, write                # denylist → --exclude-tools (optional)
+model: neuralwatt/glm-5.2-short             # supports provider/id:thinking (optional)
+extensions: npm:pi-neuralwatt-provider      # additive -e (optional, never drops the provider)
+skills: ~/.pi/agent/skills/grilling         # additive --skill (optional)
+worktree: true                              # force worktree isolation for this agent (optional)
+---
+You are a fast, surgical code scout. Reconnaissance only — never make edits.
+```
+
+Spawn-flag overlay (additive over the mode base): `extensions`/`skills` only
+ever ADD; `disallowedTools` is deny-first (then `tools` allowlist-resolves);
+`model` overrides. The system prompt → a temp file + `--append-system-prompt`.
+
+### Chain templates (`~/.pi/agent/chains/*.yaml`)
+
+YAML frontmatter with a `steps` array (each `{agent, task}`); body is an optional
+template-level nudge.
+
+```yaml
+---
+name: recon-and-synth
+description: scout recon then synthesizer condenses. Minimal 2-step test chain.
+steps:
+  - agent: scout
+    task: "Investigate: {input}"
+  - agent: synthesizer
+    task: |
+      The scout agent has completed recon. Its findings:
+
+      {previous}
+
+      Based on the above, produce a tightly condensed summary.
+---
+```
+
+`{input}` substitutes the chain's input arg; `{previous}` substitutes the prior
+step's output wrapped in a provenance envelope (`[Handoff from agent: <name>]` +
+step index). Steps reference named agents only (no inline specs). On failure the
+chain **halts** at the failing step (prior steps persist for inspection); on
+explicit removal (`/subrm C1`) mid-run it **aborts** (the `aborted` flag blocks
+auto-advance + the complete follow-up; one aborted summary instead).
+
+### New/extended tools
+
+| Tool | Purpose |
+|---|---|
+| `orchestrate` | Mode 2 trigger: `template` / `steps` / `chains` / `input` / `lite`. Exactly-one precedence (template > steps; `chains` exclusive). Fire-and-forget spawn confirmation; aggregate follow-up on completion/halt. |
+| `subagent_catalog` | Discover agents + chains (name + description sequence). |
+| `subagent_list` | Lists `#N` subagents + `Ck` chains (step progress). |
+| `subagent_remove` | Accepts `#N` or `CN` (whole chain) or `CN@step` (done chain only); live-step removal guarded. |
+| `subagent_inspect` | Accepts `#N` or `CN` (chain → step picker) or `CN@2` (direct step). |
+
+### Git worktree isolation (§12)
+
+When `config.json` sets `worktree: "always"` **and** the cwd is a git repo, every
+spawned subagent / chain runs in a **fresh git worktree** on a new branch — so
+concurrent agents can't clobber each other's in-flight file edits.
+
+- **Granularity:** one worktree per chain (shared across its linear steps — a
+  `worker` step sees the `planner` step's edits) + one per standalone
+  `/sub`/`/sublite`/`subagent_create`. Parallel chains → separate worktrees.
+- **Lifecycle:** the worktree **dir** is removed on finalize/abort/explicit
+  removal; the **branch** is always kept (committed work stays recoverable).
+  **Dirty** worktrees are kept + flagged (never silently force-destroyed) — use
+  `/subrm C1` to force-discard.
+- **Per-agent override:** `worktree: true` in an agent-def forces isolation even
+  when config is `off`. Non-git cwd → shared-tree fallback.
+- Worktree children always spawn with `--no-approve` (deterministic trust). The
+  neuralwatt provider guarantee is unaffected (loaded via global packages + `-e`,
+  not project-local). Caveat: committed project-local `.pi/extensions` won't load
+  in worktree children.

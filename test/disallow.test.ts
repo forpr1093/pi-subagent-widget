@@ -6,6 +6,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  DEFAULT_DISALLOWED_EXT,
+  effectiveDisallowedExtensions,
   parseNpmName,
   normalizeForMatch,
   filterSurvivors,
@@ -153,6 +155,46 @@ test("loadDeclaredExtensions reads packages from BOTH global and project setting
   assert.ok(survivors.some((e) => e === "npm:global-pkg"), "global-pkg preserved (not dropped)");
 
   fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+test("DEFAULT_DISALLOWED_EXT excludes the widget itself so subagents can't recurse", () => {
+  // A spawned full-mode subagent must never load this widget's own tools
+  // (subagent_create, etc.) — otherwise it could recursively spawn further
+  // subagents. The widget dir is matched by its basename key.
+  assert.deepEqual(DEFAULT_DISALLOWED_EXT, ["subagent-widget"]);
+  const declared: DeclaredExt[] = [
+    { entry: "npm:pi-neuralwatt-provider", key: "pi-neuralwatt-provider" },
+    { entry: "/abs/extensions/subagent-widget/index.ts", key: "subagent-widget" },
+    { entry: "npm:pi-rtk-optimizer", key: "pi-rtk-optimizer" },
+  ];
+  const survivors = filterSurvivors(declared, [...DEFAULT_DISALLOWED_EXT]);
+  assert.deepEqual(survivors, [
+    "npm:pi-neuralwatt-provider",
+    "npm:pi-rtk-optimizer",
+  ]);
+});
+
+test("effectiveDisallowedExtensions always prepends the default, regardless of config", () => {
+  // Empty config still yields the default exclusion (no-op-on-empty no longer
+  // holds for the user list — the built-in default always applies at code level).
+  assert.deepEqual(effectiveDisallowedExtensions([]), ["subagent-widget"]);
+  // User entries are appended after the default and still honored.
+  assert.deepEqual(
+    effectiveDisallowedExtensions(["@gotgenes/pi-permission-system"]),
+    ["subagent-widget", "@gotgenes/pi-permission-system"],
+  );
+  // The default survives even an (invalid) empty-string config entry.
+  assert.deepEqual(effectiveDisallowedExtensions([""]), ["subagent-widget", ""]);
+});
+
+test("filterSurvivors excludes the default widget AND honors user disallow entries together", () => {
+  const declared: DeclaredExt[] = [
+    { entry: "npm:@gotgenes/pi-permission-system", key: "@gotgenes/pi-permission-system" },
+    { entry: "npm:pi-rtk-optimizer", key: "pi-rtk-optimizer" },
+    { entry: "/home/u/.pi/agent/extensions/subagent-widget/index.ts", key: "subagent-widget" },
+  ];
+  const disallowed = effectiveDisallowedExtensions(["@gotgenes/pi-permission-system"]);
+  assert.deepEqual(filterSurvivors(declared, disallowed), ["npm:pi-rtk-optimizer"]);
 });
 
 test("filterSurvivors does not mutate the declared input", () => {

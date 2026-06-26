@@ -1,4 +1,9 @@
 {
-  "liteAllowedExt": ["npm:pi-neuralwatt-provider"],
-  "disallowedExt": ["@gotgenes/pi-permission-system"]
+  "liteAllowedExt": [
+    "npm:pi-neuralwatt-provider"
+  ],
+  "disallowedExt": [
+    "@gotgenes/pi-permission-system"
+  ],
+  "worktree": "off"
 }

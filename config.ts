@@ -5,6 +5,9 @@
 // `disallowedExt` (new): the disallow-list for FULL subagents — when non-empty
 // and matching ≥1 declared extension, the spawn is sandboxed to the survivors
 // via `--no-extensions -e <each>`; otherwise no flags and pi discovers all.
+// On top of this user list, `subagent-widget` itself is ALWAYS excluded at
+// code level (see `DEFAULT_DISALLOWED_EXT` in disallow.ts) so a spawned
+// subagent can't recursively spawn further subagents via this widget's tools.
 // See disallow.ts and PLAN-disallow-list.md.
 //
 // Format: ["npm:pi-neuralwatt-provider", ...] under each key, or a bare array.
@@ -16,6 +19,8 @@ export function getLiteConfigPath(): string {
   return path.join(path.dirname(new URL(import.meta.url).pathname), "config.json");
 }
 
+export const NEURALWATT_PROVIDER = "npm:pi-neuralwatt-provider";
+
 export function loadLiteExtensions(): string[] {
   try {
     const raw = JSON.parse(fs.readFileSync(getLiteConfigPath(), "utf8"));
@@ -24,7 +29,7 @@ export function loadLiteExtensions(): string[] {
       return raw.liteAllowedExt.filter((e: any) => typeof e === "string");
     }
   } catch {}
-  return ["npm:pi-neuralwatt-provider"]; // fallback if missing/invalid
+  return [NEURALWATT_PROVIDER]; // fallback if missing/invalid
 }
 
 // Disallow-list for full-mode subagents. Empty fallback = no-op (pi discovers
@@ -37,4 +42,18 @@ export function loadDisallowedExtensions(): string[] {
     }
   } catch {}
   return []; // no-op fallback — pi's normal discovery runs untouched
+}
+
+// Git-worktree isolation mode (spec §12). "always" = each spawned subagent /
+// chain runs in its own fresh worktree (when the cwd is a git repo). "off"
+// (default) = today's shared-tree behavior. Read fresh on every spawn so a
+// config edit takes effect immediately, including /subcont.
+export function loadWorktreeMode(): "always" | "off" {
+  try {
+    const raw = JSON.parse(fs.readFileSync(getLiteConfigPath(), "utf8"));
+    if (raw && typeof raw === "object" && raw.worktree === "always") {
+      return "always";
+    }
+  } catch {}
+  return "off";
 }

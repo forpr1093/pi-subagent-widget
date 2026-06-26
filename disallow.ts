@@ -249,14 +249,39 @@ export function filterSurvivors(
 }
 
 /**
+ * Extensions always blocked from full-mode subagents, independent of
+ * `config.json`. The subagent-widget itself is excluded by default so a spawned
+ * subagent cannot recursively spawn further subagents through this widget's own
+ * tools (`subagent_create`, `subagent_continue`, …) — that recursive spawning
+ * is unintended. Keys are normalized by `normalizeForMatch`, exactly like a
+ * `disallowedExt` entry, and merged with the user config on every full-mode
+ * spawn. Lite mode needs no such guard: it never loads the widget (the widget
+ * isn't in `liteAllowedExt`).
+ */
+export const DEFAULT_DISALLOWED_EXT: readonly string[] = ["subagent-widget"];
+
+/**
+ * The effective full-mode disallow list: the built-in defaults (always
+ * excluded, see `DEFAULT_DISALLOWED_EXT`) plus the user's `disallowedExt` from
+ * `config.json`. Pure — takes the user list as input so it's unit-testable
+ * without filesystem I/O. Defaults come first so they're never shadowed by an
+ * (invalid) empty config entry.
+ */
+export function effectiveDisallowedExtensions(userList: string[]): string[] {
+  return [...DEFAULT_DISALLOWED_EXT, ...userList];
+}
+
+/**
  * Entry point for full-mode spawns. Returns the `-e` survivor list to inject
- * after `--no-extensions`, or null when no flags should be added. Reads
- * `disallowedExt` and the declared extensions fresh on every call (so edits to
- * config.json take effect on the next spawn, including `/subcont` — no freeze).
+ * after `--no-extensions`, or null when no flags should be added (only when
+ * nothing matches — `filterSurvivors`'s criterion b). Always excludes the
+ * built-in defaults (`DEFAULT_DISALLOWED_EXT`) on top of the user config, so a
+ * subagent never re-loads this widget's own tools. Reads both fresh on every
+ * call (so edits to config.json take effect on the next spawn, including
+ * `/subcont` — no freeze).
  */
 export function resolveFullModeExtArgs(cwd: string): string[] | null {
-  const disallowed = loadDisallowedExtensions();
-  if (disallowed.length === 0) return null;
+  const disallowed = effectiveDisallowedExtensions(loadDisallowedExtensions());
   const declared = loadDeclaredExtensions(cwd);
   return filterSurvivors(declared, disallowed);
 }
