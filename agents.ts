@@ -196,6 +196,9 @@ export function agentConfigFlags(a: AgentConfig): string[] {
   if (a.disallowedTools?.length)
     out.push("--exclude-tools", a.disallowedTools.join(","));
   if (a.tools?.length) out.push("--tools", a.tools.join(","));
-  if (a.model) out.push("--model", a.model);
+  // model: "default" is a no-op keyword meaning "defer to pi's default model
+  // resolution" (settings.json defaultModel) — identical to omitting the field,
+  // just an explicit spelling for agent-defs that want the line present-but-neutral.
+  if (a.model && a.model !== "default") out.push("--model", a.model);
   return out;
 }

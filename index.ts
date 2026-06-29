@@ -1862,7 +1862,8 @@ Modes (via the 'lite' parameter):
       const sample = agBoth.agents[0];
       if (sample) {
         lines.push(`Sample agent:     ${sample.name} — ${sample.description}`);
-        lines.push(`  tools=${sample.tools?.join(",") ?? "(default)"} model=${sample.model ?? "(default)"}`);
+        const modelDisplay = !sample.model || sample.model === "default" ? "(default)" : sample.model;
+        lines.push(`  tools=${sample.tools?.join(",") ?? "(default)"} model=${modelDisplay}`);
         lines.push(`  extensions=${sample.extensions?.join(",") ?? "(none additive)"} skills=${sample.skills?.join(",") ?? "(none)"} disallowedTools=${sample.disallowedTools?.join(",") ?? "(none)"}`);
       } else {
         lines.push("Sample agent:     (none defined — create *.md in the agent dir)");
