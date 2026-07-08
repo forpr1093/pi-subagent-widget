@@ -336,6 +336,7 @@ export default function (pi: ExtensionAPI) {
         stdio: ["ignore", "pipe", "pipe"],
         env: { ...process.env },
         shell: process.platform === "win32",
+      });
       state.proc = proc;
       const startTime = Date.now();
       const timer = setInterval(() => {
