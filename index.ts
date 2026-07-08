@@ -52,7 +52,7 @@ import { appendText, cap, openInspector, stringifyVal, transcriptText } from "./
 import { deleteSessionFile, makeSessionFile } from "./session.ts";
 import { loadDisallowedExtensions, loadLiteExtensions, loadWorktreeMode, NEURALWATT_PROVIDER } from "./config.ts";
 import { effectiveDisallowedExtensions, normalizeForMatch, resolveFullModeExtArgs } from "./disallow.ts";
-import { buildSubagentWidget } from "./widget.ts";
+import { buildChainWidget, buildSubagentWidget } from "./widget.ts";
 import {
   agentConfigFlags,
   discoverAgents,
@@ -161,8 +161,19 @@ export default function (pi: ExtensionAPI) {
   function updateWidgets() {
     if (!widgetCtx) return;
     try {
+      // Standalone subagents render one `sub-${id}` box each. Chain-step
+      // SubStates (chainId set) skip the per-step box — they render as rows
+      // inside their chain's composite `chain-${id}` widget below, so a chain
+      // shows as ONE grouped, labeled box instead of N look-alike step boxes.
       for (const [id, state] of Array.from(agents.entries())) {
+        if (state.chainId !== undefined) continue;
         widgetCtx.ui.setWidget(`sub-${id}`, buildSubagentWidget(state));
+      }
+      for (const chain of Array.from(chains.values())) {
+        widgetCtx.ui.setWidget(
+          `chain-${chain.id}`,
+          buildChainWidget(chain, (sid) => agents.get(sid)),
+        );
       }
     } catch {
       // widgetCtx can go stale across session boundaries (e.g. a triggerTurn
@@ -1246,6 +1257,10 @@ Modes (via the 'lite' parameter):
     // §12: a completed chain released its branch — remove the dir (keep branch).
     // Dirty trees are kept (the worker's uncommitted edits survive for merge).
     cleanupWorktree(chain.worktree);
+    // The step's close handler ran updateWidgets() BEFORE the coordinator
+    // flipped the chain to terminal — so the chain header would otherwise
+    // freeze on ⏳. Refresh so the box now reads ✓/✗/⊘.
+    updateWidgets();
   }
 
   function failChain(chain: ChainState, errorText: string) {
@@ -1271,6 +1286,7 @@ Modes (via the 'lite' parameter):
       { deliverAs: "followUp", triggerTurn: true },
     );
     cleanupWorktree(chain.worktree); // §12: failed chain removes its worktree dir too
+    updateWidgets(); // flip header from ⏳ to ✗ (see finalizeChain for why)
   }
 
   function abortChain(chain: ChainState, force = false) {
@@ -1300,6 +1316,7 @@ Modes (via the 'lite' parameter):
       { deliverAs: "followUp", triggerTurn: true },
     );
     cleanupWorktree(chain.worktree, force); // §12: aborted chain removes its worktree dir
+    updateWidgets(); // flip header from ⏳ to ⊘ (see finalizeChain for why)
   }
 
   // Remove a whole chain: abort (one summary) + prune its step SubStates +
@@ -1316,6 +1333,7 @@ Modes (via the 'lite' parameter):
       if (s) deleteSessionFile(s);
       agents.delete(sid);
     }
+    ctx.ui.setWidget(`chain-${chain.id}`, undefined);
     chains.delete(chain.id);
   }
 
@@ -1349,6 +1367,7 @@ Modes (via the 'lite' parameter):
           deleteSessionFile(s);
           agents.delete(sid);
         }
+        updateWidgets(); // refresh the chain box so the removed step row disappears
         return { msg: `Step C${target.chainId}@${target.step} removed.`, isError: false };
       }
       const n = chain.subagentIds.length;
@@ -1372,6 +1391,7 @@ Modes (via the 'lite' parameter):
     deleteSessionFile(state);
     cleanupWorktree(state.worktree, true); // §12: explicit /subrm #N force-removes a dirty standalone tree
     agents.delete(id);
+    updateWidgets(); // if this was a step of a finished chain, refresh that box
     return {
       msg: `Subagent #${id}${wasRunning ? " killed and" : ""} removed.`,
       isError: false,
@@ -1664,6 +1684,7 @@ Modes (via the 'lite' parameter):
         for (const sid of chain.subagentIds) {
           ctx.ui.setWidget(`sub-${sid}`, undefined);
         }
+        ctx.ui.setWidget(`chain-${chain.id}`, undefined);
         cleanupWorktree(chain.worktree);
       }
       const total = agents.size;
@@ -1894,6 +1915,7 @@ Modes (via the 'lite' parameter):
       cleanupWorktree(state.worktree); // R3: clean slate for widgets/id — but clean-only so a dirty tree is KEPT + warned, not force-destroyed (force is for /subrm)
     }
     for (const chain of Array.from(chains.values())) {
+      ctx.ui.setWidget(`chain-${chain.id}`, undefined);
       cleanupWorktree(chain.worktree);
     }
     agents.clear();

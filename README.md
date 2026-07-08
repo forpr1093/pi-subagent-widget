@@ -141,6 +141,25 @@ never frozen across turns).
 
 Each subagent writes its conversation to a JSONL file under `~/.pi/agent/sessions/subagents/`. These files are deleted when the subagent is removed (`/subrm`, `/subclear`, `subagent_remove`, or on `session_start`/resume). Subagents that finish naturally keep their file (so `/subcont` works mid-session) until explicitly removed.
 
+## Stacked widgets
+
+One bordered box is stacked above the editor per active entity:
+
+- **Standalone subagent** (`/sub`, `/sublite`, `subagent_create`) → one `sub-${id}`
+  box: `● Subagent #3 ⚡lite · 12s | Tools: 5` + a live `▸ last activity` line.
+- **Chain** (`/subchain`, `orchestrate`) → **one composite `chain-${id}` box per
+  chain**, not one box per step. The header carries the C-id + name so multiple
+  concurrent chains are distinguishable at a glance
+  (`⏳ ⛓ C1 "recon-and-synth" · step 1/3 · scout ⚡lite · (12s, 5 tools)`),
+  followed by one row per step (`● #3 scout · 12s · 5 tools`, `○ synthesizer`,
+  `✓ #5 …`). Only the currently-running step shows a live activity line,
+  keeping finished chains compact.
+
+The chain box is the live counterpart of `/sublist`/`/subinspect` for seeing
+both *which agent is in which chain* and *that it is in a chain at all* — the
+old design stacked N identical per-step boxes that were indistinguishable from
+standalone subagents.
+
 ## Inspector
 
 `/subinspect` opens a floating, read-only overlay that shows, for the selected
