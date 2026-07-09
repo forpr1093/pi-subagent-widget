@@ -437,7 +437,7 @@ export default function (pi: ExtensionAPI) {
   // ── Tools for the Main Agent ──────────────────────────────────────────────
   pi.registerTool({
     name: "subagent_create",
-    description: `Spawn a background subagent to perform a task without disrupting the main conversation & process. Returns the subagent ID immediately while it runs in the background. Results will be delivered as a follow-up message when finished.
+    description: `Spawn a background subagent to perform a task without disrupting the main conversation & process. Returns the subagent ID immediately while it runs in the background; the subagent pings back with its result as a follow-up message when it finishes, so you can continue other work or stop your turn in the meantime.
 
 Modes (via the 'lite' parameter):
 - lite=false (default): full subagent. Extensions enabled, unrestricted tools, default thinking level, default model. Use for complex tasks that benefit from extensions and reasoning.
@@ -489,7 +489,7 @@ Modes (via the 'lite' parameter):
   pi.registerTool({
     name: "subagent_continue",
     description:
-      "Continue an existing subagent's conversation. Use this to give further instructions to a finished subagent. Returns immediately while it runs in the background. The subagent's original lite/full mode is preserved on continuation.\n P.S. User is able to create a subagent in background too.",
+      "Continue an existing subagent's conversation. Use this to give further instructions to a finished subagent. Returns immediately while it runs in the background; the subagent pings back with its result as a follow-up message when it finishes, so you can continue other work or stop your turn in the meantime. The subagent's original lite/full mode is preserved on continuation.\n P.S. User is able to create a subagent in background too.",
     parameters: Type.Object({
       id: Type.Number({ description: "The ID of the subagent to continue" }),
       prompt: Type.String({
@@ -835,7 +835,7 @@ Modes (via the 'lite' parameter):
   pi.registerTool({
     name: "orchestrate",
     description:
-      "Run a multi-agent chain in the background (auto-advance, fire-and-forget). The final result is delivered as a follow-up message when the chain completes or halts. Pass exactly one of: `template` (named chain from ~/.pi/agent/chains/), `steps` (inline LLM-authored step list referencing named agents), or `chains` (run multiple). `template` wins over `steps` if both set. Agents & templates are discoverable via the `subagent_catalog` tool — call it before authoring `steps` or using `template`.",
+      "Run a multi-agent chain in the background (auto-advance, fire-and-forget). The final result is delivered as a follow-up message when the chain completes or halts, so you can continue other work or stop your turn in the meantime. Pass exactly one of: `template` (named chain from ~/.pi/agent/chains/), `steps` (inline LLM-authored step list referencing named agents), or `chains` (run multiple). `template` wins over `steps` if both set. Agents & templates are discoverable via the `subagent_catalog` tool — call it before authoring `steps` or using `template`.",
     parameters: Type.Object({
       template: Type.Optional(
         Type.String({
@@ -1519,13 +1519,37 @@ Modes (via the 'lite' parameter):
   // ── /sub ───────────────────────────────────────────────────────────
   pi.registerCommand("sub", {
     description:
-      "Spawn a full subagent (extensions on, default tools/thinking/model) with live widget: /sub <task>",
+      "Spawn a full subagent with live widget: /sub <task> | /sub <agent> <task>. Named agent applies its tools/extensions/skills/model+system prompt.",
     handler: async (args, ctx) => {
       widgetCtx = ctx;
-      const task = args?.trim();
-      if (!task) {
-        ctx.ui.notify("Usage: /sub <task>", "error");
+      const raw = args?.trim();
+      if (!raw) {
+        ctx.ui.notify("Usage: /sub <task>  |  /sub <agent> <task>", "error");
         return;
+      }
+      // First-token-if-matches: if the first word is a known named agent
+      // (user+project, matching subagent_catalog), treat it as the agent-def
+      // and the remainder as the task. Otherwise the whole string is a bare
+      // task (backward compatible). lite is blocked from named agents: an
+      // agent's extensions would bypass --no-extensions via explicit -e,
+      // defeating lite's sandbox (see /sublite handler).
+      const sp = raw.indexOf(" ");
+      const first = sp === -1 ? raw : raw.slice(0, sp);
+      const known = discoverAgents(ctx.cwd, "both").agents.find(
+        (a) => a.name === first,
+      );
+      let agentConfig: AgentConfig | undefined;
+      let task = raw;
+      if (known && sp !== -1) {
+        agentConfig = known;
+        task = raw.slice(sp + 1).trim();
+        if (!task) {
+          ctx.ui.notify(
+            `Usage: /sub ${known.name} <task>  (agent "${known.name}" needs a task)`,
+            "error",
+          );
+          return;
+        }
       }
       const id = nextId++;
       const wt = maybeCreateWorktree(ctx, "pi-sub", id);
@@ -1544,19 +1568,32 @@ Modes (via the 'lite' parameter):
       };
       agents.set(id, state);
       updateWidgets();
-      spawnAgent(state, task, ctx, false, undefined, wt?.path);
+      spawnAgent(state, task, ctx, false, agentConfig, wt?.path);
     },
   });
 
   // ── /sublite ─────────────────────────────────────────────────────────────
   pi.registerCommand("sublite", {
     description:
-      "Spawn a lite subagent (no extensions, restricted tools, thinking off) with live widget: /sublite <task>",
+      "Spawn a lite subagent (no extensions, restricted tools, thinking off) with live widget: /sublite <task>. Named agents are not supported here.",
     handler: async (args, ctx) => {
       widgetCtx = ctx;
-      const task = args?.trim();
-      if (!task) {
+      const raw = args?.trim();
+      if (!raw) {
         ctx.ui.notify("Usage: /sublite <task>", "error");
+        return;
+      }
+      // Hard block named-agent form: an agent's extensions would be emitted
+      // as explicit -e, which bypasses --no-extensions and would re-enable
+      // heavy extensions in lite. Lite subagents are bare-task only.
+      const sp = raw.indexOf(" ");
+      const first = sp === -1 ? raw : raw.slice(0, sp);
+      if (sp !== -1 &&
+        discoverAgents(ctx.cwd, "both").agents.some((a) => a.name === first)) {
+        ctx.ui.notify(
+          `Named agent "${first}" can't be used in lite mode (agents may require extensions/skills that lite restricts). Use /sub ${first} <task> instead.`,
+          "error",
+        );
         return;
       }
       const id = nextId++;
