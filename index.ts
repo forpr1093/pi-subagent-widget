@@ -297,23 +297,35 @@ export default function (pi: ExtensionAPI) {
     // Agent-def overlay (additive over the mode base; spec §3.3). extensions/
     // skills only ever ADD; tools allowlist-restricts; disallowedTools deny-first;
     // model overrides. System prompt → temp file + --append-system-prompt.
+    //
+    // Subagent identity injection: a spawned child is a fresh `pi` process
+    // with no inherent notion it's a subagent — inject a short operational
+    // frame so it knows it's a background agent, who spawned it (user via a
+    // slash command vs the main agent via a tool), and that its output is
+    // returned automatically (work autonomously, don't await user input).
+    // Merged into the one --append-system-prompt file: pi keeps only the
+    // FIRST flag, so agent identity + subagent context + chain position must
+    // all land in a single file here.
+    const originLabel = state.origin === "user"
+      ? "the user (via a slash command)"
+      : "the main agent (via a tool call)";
+    const subagentContext =
+      `[Subagent context]\n` +
+      `You are a subagent — a background agent spawned by ${originLabel} to perform a delegated task. You are not the main agent and do not interact with the user directly. Work autonomously on the task; when finished, your final output is returned to ${originLabel} automatically.`;
     let promptTmp: { dir: string; path: string } | null = null;
     if (agentConfig) {
       for (const f of agentConfigFlags(agentConfig)) args.push(f);
-      // B (role fact): chain position (step N of M, prev/next agent) lives in
-      // the system prompt, not the task — so step 1 knows it's first and the
-      // final step knows it's last. Merged with the agent's own systemPrompt
-      // into one temp file: pi keeps only the FIRST --append-system-prompt flag
-      // when several are passed, so a second flag would clobber the agent's
-      // identity — must merge into the one file here.
-      let body = agentConfig.systemPrompt;
-      if (chainContext) {
-        body = body.trim() ? body + "\n\n" + chainContext : chainContext;
-      }
-      if (body.trim()) {
-        promptTmp = writeAgentPromptFile(agentConfig.name, body);
-        args.push("--append-system-prompt", promptTmp.path);
-      }
+    }
+    // Assemble body: agent role (if any) → subagent context → chain position (if any).
+    const bodyParts: string[] = [];
+    if (agentConfig?.systemPrompt.trim())
+      bodyParts.push(agentConfig.systemPrompt.trim());
+    bodyParts.push(subagentContext);
+    if (chainContext?.trim()) bodyParts.push(chainContext.trim());
+    const body = bodyParts.join("\n\n");
+    if (body.trim()) {
+      promptTmp = writeAgentPromptFile(agentConfig?.name ?? "subagent", body);
+      args.push("--append-system-prompt", promptTmp.path);
     }
 
     // B2/R2: the prompt is the final positional arg. pi's argv parser eats a
@@ -439,23 +451,64 @@ export default function (pi: ExtensionAPI) {
     name: "subagent_create",
     description: `Spawn a background subagent to perform a task without disrupting the main conversation & process. Returns the subagent ID immediately while it runs in the background; the subagent pings back with its result as a follow-up message when it finishes, so you can continue other work or stop your turn in the meantime.
 
+Optional \`agent\` (named agent from the \`subagent_catalog\` tool, e.g. "scout"): run the subagent under that agent's role — its system prompt, tools, skills, model, and extensions are applied over the base mode. Use this for single-task agent-driven work without the overhead of the \`orchestrate\` multi-step chain tool. Not supported with lite=true (an agent's extensions would bypass lite's --no-extensions sandbox); combine \`agent\` with \`lite: false\` instead.
+
 Modes (via the 'lite' parameter):
 - lite=false (default): full subagent. Extensions enabled, unrestricted tools, default thinking level, default model. Use for complex tasks that benefit from extensions and reasoning.
-- lite=true: lite subagent. Only the extensions listed in config.json (sibling of this file) load; restricted tools (read,bash,grep,find,ls), thinking off. Faster and cheaper — use for simple, well-scoped tasks that need only those tools. If the task needs any other tool (e.g. web fetch/search, browser, context7), use lite=false instead. To orchestrate multi-agent workflows use the \`orchestrate\` tool; to discover defined agents/templates use the \`subagent_catalog\` tool.`,
+- lite=true: lite subagent. Only the extensions listed in config.json (sibling of this file) load; restricted tools (read,bash,grep,find,ls), thinking off. Faster and cheaper — use for simple, well-scoped tasks that need only those tools. If the task needs any other tool (e.g. web fetch/search, browser, context7), use lite=false instead. To discover defined agents/templates use the \`subagent_catalog\` tool; to orchestrate multi-step agent workflows use the \`orchestrate\` tool.`,
     parameters: Type.Object({
       task: Type.String({
         description:
           "The complete task description for the subagent to perform",
       }),
+      agent: Type.Optional(
+        Type.String({
+          description:
+            'Optional: name of a defined agent (from subagent_catalog, e.g. "scout") whose role to run under — applies its system prompt, tools, skills, model, and extensions over the base mode. Not supported with lite=true. Omit for a bare subagent (no role overlay).',
+        }),
+      ),
       lite: Type.Boolean({
         description:
-          "If true, run in lite mode: no extensions, restricted tools (read,bash,grep,find,ls), thinking off. If false (default), run in full mode with extensions and the default toolset/thinking/model. If the task needs any tool not in the lite set (e.g. web fetch/search, browser, context7), use lite=false.",
+          "If true, run in lite mode: no extensions, restricted tools (read,bash,grep,find,ls), thinking off. If false (default), run in full mode with extensions and the default toolset/thinking/model. If the task needs any tool not in the lite set (e.g. web fetch/search, browser, context7), use lite=false. Not supported with `agent` — use lite=false when spawning a named agent.",
         default: false,
       }),
     }),
     execute: async (callId, args, _signal, _onUpdate, ctx) => {
       widgetCtx = ctx;
       const lite = args.lite ?? false;
+      // Resolve optional named-agent overlay. Same path /sub <agent> and chain
+      // steps use: discoverAgents("both") → agentConfigFlags emits the agent's
+      // tools/skills/extensions/model, spawnAgent writes its systemPrompt to a
+      // temp file via --append-system-prompt. Lite + agent is hard-blocked: an
+      // agent's extensions would be emitted as explicit -e, bypassing lite's
+      // --no-extensions sandbox (mirrors the /sublite named-agent block).
+      let agentConfig: AgentConfig | undefined;
+      if (args.agent) {
+        if (lite) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error: named agent "${args.agent}" can't be used in lite mode (an agent may require extensions/skills that lite restricts). Spawn with lite=false instead, or use orchestrate for multi-step lite chains if you really need that combination.`,
+              },
+            ],
+          };
+        }
+        const found = discoverAgents(ctx.cwd, "both").agents.find(
+          (a) => a.name === args.agent,
+        );
+        if (!found) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error: no named agent "${args.agent}". Call subagent_catalog to list available agents.`,
+              },
+            ],
+          };
+        }
+        agentConfig = found;
+      }
       const id = nextId++;
       const wt = maybeCreateWorktree(ctx, "pi-sub", id);
       const state: SubState = {
@@ -474,12 +527,12 @@ Modes (via the 'lite' parameter):
       agents.set(id, state);
       updateWidgets();
       // Fire-and-forget
-      spawnAgent(state, args.task, ctx, lite, undefined, wt?.path);
+      spawnAgent(state, args.task, ctx, lite, agentConfig, wt?.path);
       return {
         content: [
           {
             type: "text",
-            text: `Subagent #${id} spawned${lite ? " (lite)" : ""} and running in background.`,
+            text: `Subagent #${id} spawned${lite ? " (lite)" : ""}${agentConfig ? ` as agent "${agentConfig.name}"` : ""} and running in background.`,
           },
         ],
       };
