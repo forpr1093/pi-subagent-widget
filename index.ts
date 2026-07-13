@@ -1596,6 +1596,7 @@ Modes (via the 'lite' parameter):
         );
         return;
       }
+      const task = raw;
       const id = nextId++;
       const wt = maybeCreateWorktree(ctx, "pi-sub", id);
       const state: SubState = {
