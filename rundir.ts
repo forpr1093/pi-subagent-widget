@@ -25,6 +25,10 @@ export interface RunMeta {
   lite: boolean;
   spawnTime: number;
   parentPid: number;
+  /** The spawned worker pi's own pid (the process-group leader). Set after
+   *  spawn (createRunDir runs before the child exists). The Q9 reaper uses it
+   *  to process-group-kill an orphaned worker whose parent pi died. */
+  pid?: number;
 }
 
 /** Path of the run dir for a given subagent id (may not exist yet). */
@@ -47,6 +51,15 @@ export function writeMeta(dir: string, meta: RunMeta): void {
     encoding: "utf-8",
     mode: 0o600,
   });
+}
+
+/** Patch the worker pid into an existing run's meta.json (called from
+ *  spawnAgent once pi's child pid is known). No-op if the dir/meta is gone. */
+export function setRunPid(dir: string, pid: number): void {
+  const meta = readMeta(dir);
+  if (!meta) return;
+  meta.pid = pid;
+  writeMeta(dir, meta);
 }
 
 /** Write the --append-system-prompt body as prompt.md inside the run dir.

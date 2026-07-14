@@ -51,8 +51,11 @@ import { appendText, cap, openInspector, stringifyVal, transcriptText } from "./
 import { makeSessionFile } from "./session.ts";
 import {
   createRunDir,
+  readMeta,
   removeRunDir,
   runDirPath,
+  RUNS_DIR,
+  setRunPid,
   writePromptFile,
   writeResultFile,
   type RunMeta,
@@ -130,36 +133,79 @@ function parseTargetId(raw: string | number): TargetId {
   return { kind: "invalid", reason: `"${raw}" is not a #N or CN id` };
 }
 
-/** Q3: kill a subagent's whole process group (graceful SIGTERM → forced SIGKILL
+/** Q3: kill a subagent's whole process group (graceful SIGTERM -> forced SIGKILL
  *  after ~5s). The child was spawned detached:true so it (and every process it
- *  spawned) share one process group rooted at proc.pid; a negative pid kills the
+ *  spawned) share one process group rooted at its pid; a negative pid kills the
  *  entire group at once, so grandchildren (git, npm, dev servers) die with the
  *  worker instead of orphaning (holding file locks + worktrees). Mirrors pi's
- *  own exec.js graceful→forced pattern. On Windows (no setsid) falls back to a
- *  direct proc.kill. Best-effort: a kill failure must never crash the extension. */
-function terminateProcessGroup(proc: any) {
-  if (!proc || proc.pid === undefined) return;
-  const pid = proc.pid;
+ *  own exec.js graceful->forced. On Windows (no setsid) falls back to a direct
+ *  pid kill. Best-effort: a kill failure must never crash the extension. */
+function killProcessGroupByPid(pid: number) {
   const win32 = process.platform === "win32";
+  const killOne = (sig: NodeJS.Signals) => {
+    try { process.kill(pid, sig); } catch {}
+  };
   const killGroup = (sig: NodeJS.Signals) => {
-    if (win32) { proc.kill(sig); return; }
+    if (win32) { killOne(sig); return; }
     try {
       process.kill(-pid, sig);
-    } catch (err: any) {
+    } catch {
       // ESRCH = group already gone (normal if it closed); fall back to direct.
-      try { proc.kill(sig); } catch {}
+      killOne(sig);
     }
   };
   killGroup("SIGTERM");
   const guard = setTimeout(() => {
-    try {
-      if (!win32) process.kill(-pid, "SIGKILL");
-      else proc.kill("SIGKILL");
-    } catch {
-      // already dead — nothing to do.
-    }
+    if (win32) killOne("SIGKILL");
+    else { try { process.kill(-pid, "SIGKILL"); } catch {} }
   }, 5000);
   guard.unref?.();
+}
+
+function terminateProcessGroup(proc: any) {
+  if (!proc || proc.pid === undefined) return;
+  killProcessGroupByPid(proc.pid);
+}
+
+/** Is a pid still alive? (process.kill with signal 0 probes liveness.) */
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Q9: sweep stale RunDirs whose spawning pi (meta.parentPid) is no longer
+ *  alive. Single reap condition (no age / no status checks — every run the
+ *  sweep should NOT touch is already excluded by "parentPid alive"). Reap =
+ *  process-group kill the orphaned worker if its pid is known + alive, then
+ *  rm -rf the run dir. Returns the reaped run ids (for /sub doctor reporting).
+ *  In-session zombies (worker exited, parent still alive) are intentionally
+ *  NOT reaped here — those are a /sub doctor diagnostic, not a sweep rule. */
+function sweepRuns(): string[] {
+  const reaped: string[] = [];
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(RUNS_DIR);
+  } catch {
+    return reaped; // no runs dir yet — nothing to sweep
+  }
+  for (const name of entries) {
+    if (!/^\d+$/.test(name)) continue; // only numeric run ids (this session's)
+    const dir = path.join(RUNS_DIR, name);
+    const meta = readMeta(dir);
+    if (!meta) continue; // corrupt/incomplete — leave for /sub doctor
+    if (isPidAlive(meta.parentPid)) continue; // parent alive -> not reapable
+    // Orphan: parent pi is gone. Kill the live worker process-group (a
+    // detached worker may still be running — esp. a blocked one idle between
+    // turns), then remove the run dir.
+    if (meta.pid && isPidAlive(meta.pid)) killProcessGroupByPid(meta.pid);
+    removeRunDir(dir);
+    reaped.push(name);
+  }
+  return reaped;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -372,6 +418,10 @@ export default function (pi: ExtensionAPI) {
         detached: process.platform !== "win32",
       });
       state.proc = proc;
+      // Q9: persist the worker pid into meta.json so the reaper can process-
+      // group-kill an orphaned worker whose parent pi died (meta was written
+      // before the child existed; patch it now that pid is known).
+      setRunPid(state.runDir, proc.pid!);
       const startTime = Date.now();
       const timer = setInterval(() => {
         state.elapsed = Date.now() - startTime;
@@ -2081,5 +2131,10 @@ Modes (via the 'lite' parameter):
     chains.clear();
     nextChainId = 1;
     widgetCtx = ctx;
+    // Q9: reap runs orphaned by a prior-session pi (crash, kill, abandoned
+    // blocked). Fires at the natural lifecycle boundary (restart = new
+    // session_start) so orphans are swept immediately, not "one session later".
+    // Silent — a count is reported on demand via /sub doctor (step 7).
+    sweepRuns();
   });
 }
