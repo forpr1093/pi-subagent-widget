@@ -676,7 +676,7 @@ Optional \`agent\` runs the subagent under a named agent's role (its system prom
   pi.registerTool({
     name: "subagent_continue",
     description:
-      "Continue an existing subagent's conversation — give further instructions to a finished subagent, or answer a subagent that blocked on a \"??\" question (its followUp said \"blocked, asking:\"). Use this to cooperate with a subagent that asked you something mid-task. Returns immediately while it runs in the background; the subagent pings back with its result as a follow-up message when it finishes. The subagent's original lite/full mode is preserved.\n P.S. User is able to create a subagent in background too.",
+      "Continue an existing subagent's conversation — give further instructions to a finished subagent, or answer a subagent that blocked on a \"??\" question (its followUp said \"blocked, asking:\"). Use this to cooperate with a subagent that asked you something mid-task. Returns immediately while it runs in the background; the subagent pings back with its result as a follow-up message when it finishes. The subagent's original lite/full mode is preserved.\n P.S. User is able to create a subagent in background too. Run artifacts for any subagent live at ~/.pi/agent/runs/<id>/ — `read` its result.txt / session.jsonl / meta.json to inspect one.",
     parameters: Type.Object({
       id: Type.Number({ description: "The ID of the subagent to continue" }),
       prompt: Type.String({
@@ -1421,9 +1421,9 @@ Optional \`agent\` runs the subagent under a named agent's role (its system prom
     return steps;
   }
 
-  /** Combined subagent + chain listing, shared by the `subagent_list` tool and
-   *  `/sublist` command (spec §5.1/§6.2). Extends the existing subagent rows with
-   *  a `(chain Ck)` tag + a Chains section: `Ck "name" · step i/N · agent` +
+  /** Combined subagent + chain listing, shared by the `/sublist` command
+   *  (spec §5.1/§6.2). Extends the existing subagent rows with a
+   *  `(chain Ck)` tag + a Chains section: `Ck "name" · step i/N · agent` +
    *  running/done/error icon. */
   function buildList(ctx: any): string {
     const sections: string[] = [];
