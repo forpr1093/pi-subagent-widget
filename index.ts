@@ -1517,7 +1517,19 @@ Optional \`agent\` runs the subagent under a named agent's role (its system prom
       widgetCtx = ctx;
       const raw = args?.trim();
       if (!raw) {
-        ctx.ui.notify("Usage: /sub <task>  |  /sub <agent> <task>", "error");
+        // Q8: /sub no-arg = the family landing (goal #4's user-side surface).
+        ctx.ui.notify(
+          [
+            "Subagent family:",
+            "  /sub, /sublite — spawn a background subagent",
+            "  /sublist — view running subagents + chains · /subinspect — drill into one",
+            "  /subcont — continue or answer a '??' question · /subrm, /subclear — remove",
+            "  /subchain — run a multi-agent pipeline · /sub doctor — health + sweep dead runs",
+            "",
+            "Spawn: /sub <task>  |  /sub <agent> <task>",
+          ].join("\n"),
+          "info",
+        );
         return;
       }
       // First-token-if-matches: if the first word is a known named agent
@@ -1908,12 +1920,45 @@ Optional \`agent\` runs the subagent under a named agent's role (its system prom
     },
   });
 
-  // ── /subchain-doctor (read-only diagnostics, spec §6.2/§9 item 9) ────────
-  pi.registerCommand("subchain-doctor", {
+  // ── /sub doctor (on-demand sweep + absorbed config diagnostics, Q8) ──────
+  // Two jobs: (1) run the Q9 orphan sweep (report reaped) + scan in-session
+  // zombie RunDirs (worker gone, parent alive, dir not tracked — report only,
+  // let the user /subrm deliberately); (2) the old /subchain-doctor config
+  // diagnostics (resolved dirs, discovery counts, sample agent, extension
+  // survival). /subchain-doctor is retired (no alias — refactor-in-place).
+  pi.registerCommand("sub doctor", {
     description:
-      "Read-only diagnostics: resolved agent/chain dirs, discovery counts, sample agent, extensions survival",
+      "Health check: sweep orphaned runs + report in-session zombies + show agent/chain discovery + extension survival",
     handler: async (_args, ctx) => {
       widgetCtx = ctx;
+      const lines: string[] = ["Subagent-widget doctor"];
+      // (1) Orphan sweep: reap runs whose spawning pi (parentPid) is dead.
+      const reaped = sweepRuns();
+      lines.push(`Runs dir:          ${RUNS_DIR}`);
+      lines.push(
+        `Orphan sweep:      ${reaped.length === 0 ? "no orphaned runs" : `reaped ${reaped.length} (${reaped.map((n) => "#" + n).join(", ")})`}`,
+      );
+      // In-session zombies: runDirs whose parent is alive but which aren't
+      // tracked in the in-memory agents map (worker exited, dir remains).
+      // Reported, not reaped — Q9 doctor-feature, not a sweep rule.
+      const zombies: string[] = [];
+      try {
+        for (const name of fs.readdirSync(RUNS_DIR)) {
+          if (!/^\d+$/.test(name)) continue;
+          const dir = path.join(RUNS_DIR, name);
+          const meta = readMeta(dir);
+          if (!meta) {
+            zombies.push(`runs/${name} (no meta)`);
+            continue;
+          }
+          if (isPidAlive(meta.parentPid) && !agents.has(meta.id))
+            zombies.push(`runs/${name}`);
+        }
+      } catch {}
+      lines.push(
+        `In-session zombies: ${zombies.length === 0 ? "none" : `${zombies.length} (${zombies.join(", ")}) — /subrm <id> to reap`}`,
+      );
+      // (2) Absorbed /subchain-doctor config diagnostics.
       const agentRoot = getAgentDir();
       const agentDir = path.join(agentRoot, "agents");
       const chainDir = path.join(agentRoot, "chains");
@@ -1923,32 +1968,31 @@ Optional \`agent\` runs the subagent under a named agent's role (its system prom
       const projAgents = agBoth.agents.filter((a) => a.source === "project");
       const userChains = chBoth.chains.filter((c) => c.source === "user");
       const projChains = chBoth.chains.filter((c) => c.source === "project");
-      const lines: string[] = ["Subagent-widget doctor"];
-      lines.push(`Agent dir:        ${agentDir} (${userAgents.length} user)`);
+      lines.push(`Agent dir:         ${agentDir} (${userAgents.length} user)`);
       if (agBoth.projectAgentsDir)
         lines.push(`Project agent dir: ${agBoth.projectAgentsDir} (${projAgents.length} project)`);
-      lines.push(`Chain dir:        ${chainDir} (${userChains.length} user)`);
+      lines.push(`Chain dir:         ${chainDir} (${userChains.length} user)`);
       if (chBoth.projectChainsDir)
         lines.push(`Project chain dir: ${chBoth.projectChainsDir} (${projChains.length} project)`);
       const sample = agBoth.agents[0];
       if (sample) {
-        lines.push(`Sample agent:     ${sample.name} — ${sample.description}`);
+        lines.push(`Sample agent:      ${sample.name} — ${sample.description}`);
         const modelDisplay = !sample.model || sample.model === "default" ? "(default)" : sample.model;
         lines.push(`  tools=${sample.tools?.join(",") ?? "(default)"} model=${modelDisplay}`);
         lines.push(`  extensions=${sample.extensions?.join(",") ?? "(none additive)"} skills=${sample.skills?.join(",") ?? "(none)"} disallowedTools=${sample.disallowedTools?.join(",") ?? "(none)"}`);
       } else {
-        lines.push("Sample agent:     (none defined — create *.md in the agent dir)");
+        lines.push("Sample agent:      (none defined — create *.md in the agent dir)");
       }
       const liteExts = loadLiteExtensions();
-      lines.push(`Lite spawn:       --no-extensions ${liteExts.map((e) => `-e ${e}`).join(" ") || "(empty!)"}`);
+      lines.push(`Lite spawn:        --no-extensions ${liteExts.map((e) => `-e ${e}`).join(" ") || "(empty!)"}`);
       const disallow = loadDisallowedExtensions();
       const survivors = resolveFullModeExtArgs(ctx.cwd);
       if (survivors === null) {
-        lines.push(`Full spawn:       discovery unrestricted (disallowedExt ${disallow.length ? `[${disallow.join(",")}] matched nothing` : "empty"})`);
+        lines.push(`Full spawn:        discovery unrestricted (disallowedExt ${disallow.length ? `[${disallow.join(",")}] matched nothing` : "empty"})`);
       } else {
         const target = normalizeForMatch("npm:pi-neuralwatt-provider");
         const hasNeuralwatt = survivors.some((s) => normalizeForMatch(s) === target);
-        lines.push(`Full spawn:       --no-extensions -e [${survivors.length} survivors] — neuralwatt ${hasNeuralwatt ? "✓ present" : "✗ MISSING"}`);
+        lines.push(`Full spawn:        --no-extensions -e [${survivors.length} survivors] — neuralwatt ${hasNeuralwatt ? "✓ present" : "✗ MISSING"}`);
       }
       ctx.ui.notify(lines.join("\n"), "info");
     },
