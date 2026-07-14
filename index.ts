@@ -47,7 +47,7 @@ import type {
   SubState,
   SubagentOrigin,
 } from "./types.ts";
-import { appendText, cap, openInspector, stringifyVal, transcriptText } from "./inspector.ts";
+import { appendText, cap, openInspector, stringifyVal } from "./inspector.ts";
 import { makeSessionFile } from "./session.ts";
 import {
   createRunDir,
@@ -576,13 +576,11 @@ export default function (pi: ExtensionAPI) {
   // ── Tools for the Main Agent ──────────────────────────────────────────────
   pi.registerTool({
     name: "subagent_create",
-    description: `Spawn a background subagent to perform a task without disrupting the main conversation & process. Returns the subagent ID immediately while it runs in the background; the subagent pings back with its result as a follow-up message when it finishes, so you can continue other work or stop your turn in the meantime.
+    description: `Spawn a background subagent to perform a task without disrupting the main conversation & process. Use this when you have substantial independent work to offload. Returns the subagent ID immediately; the subagent pings back with its result as a follow-up message when it finishes, so you can continue other work or stop your turn in the meantime.
 
-Optional \`agent\` (named agent from the \`subagent_catalog\` tool, e.g. "scout"): run the subagent under that agent's role — its system prompt, tools, skills, model, and extensions are applied over the base mode. Use this for single-task agent-driven work without the overhead of the \`orchestrate\` multi-step chain tool. Not supported with lite=true (an agent's extensions would bypass lite's --no-extensions sandbox); combine \`agent\` with \`lite: false\` instead.
+Optional \`agent\` runs the subagent under a named agent's role (its system prompt, tools, skills, model, extensions). Reuse one from \`~/.pi/agent/agents/\` (markdown files). Living subagents + their run artifacts (prompt, result, session, meta) are on disk at \`~/.pi/agent/runs/<id>/\` — \`ls\` it to see what's running, \`read\` its files to inspect one. For multi-step pipelines use the \`orchestrate\` tool instead.
 
-Modes (via the 'lite' parameter):
-- lite=false (default): full subagent. Extensions enabled, unrestricted tools, default thinking level, default model. Use for complex tasks that benefit from extensions and reasoning.
-- lite=true: lite subagent. Only the extensions listed in config.json (sibling of this file) load; restricted tools (read,bash,grep,find,ls), thinking off. Faster and cheaper — use for simple, well-scoped tasks that need only those tools. If the task needs any other tool (e.g. web fetch/search, browser, context7), use lite=false instead. To discover defined agents/templates use the \`subagent_catalog\` tool; to orchestrate multi-step agent workflows use the \`orchestrate\` tool.`,
+\`lite: true\` runs a restricted subagent (no extensions, only read/bash/grep/find/ls, thinking off) — faster and cheaper for simple, well-scoped tasks. A lite subagent physically cannot run extensions or web lookups, so a claim like "I checked the docs" carries a stronger guarantee than a full agent's. Not supported with \`agent\` (an agent's extensions would bypass lite's sandbox); use \`lite: false\` with a named agent.`,
     parameters: Type.Object({
       task: Type.String({
         description:
@@ -591,7 +589,7 @@ Modes (via the 'lite' parameter):
       agent: Type.Optional(
         Type.String({
           description:
-            'Optional: name of a defined agent (from subagent_catalog, e.g. "scout") whose role to run under — applies its system prompt, tools, skills, model, and extensions over the base mode. Not supported with lite=true. Omit for a bare subagent (no role overlay).',
+            'Optional: name of a defined agent (a file under ~/.pi/agent/agents/*.md, e.g. "scout") whose role to run under — applies its system prompt, tools, skills, model, and extensions over the base mode. Not supported with lite=true. Omit for a bare subagent (no role overlay).',
         }),
       ),
       lite: Type.Boolean({
@@ -629,7 +627,7 @@ Modes (via the 'lite' parameter):
             content: [
               {
                 type: "text",
-                text: `Error: no named agent "${args.agent}". Call subagent_catalog to list available agents.`,
+                text: `Error: no named agent "${args.agent}" in ~/.pi/agent/agents/. \`ls ~/.pi/agent/agents/\` to list available agents.`,
               },
             ],
           };
@@ -678,7 +676,7 @@ Modes (via the 'lite' parameter):
   pi.registerTool({
     name: "subagent_continue",
     description:
-      "Continue an existing subagent's conversation. Use this to give further instructions to a finished subagent. Returns immediately while it runs in the background; the subagent pings back with its result as a follow-up message when it finishes, so you can continue other work or stop your turn in the meantime. The subagent's original lite/full mode is preserved on continuation.\n P.S. User is able to create a subagent in background too.",
+      "Continue an existing subagent's conversation — give further instructions to a finished subagent, or answer a subagent that blocked on a \"??\" question (its followUp said \"blocked, asking:\"). Use this to cooperate with a subagent that asked you something mid-task. Returns immediately while it runs in the background; the subagent pings back with its result as a follow-up message when it finishes. The subagent's original lite/full mode is preserved.\n P.S. User is able to create a subagent in background too.",
     parameters: Type.Object({
       id: Type.Number({ description: "The ID of the subagent to continue" }),
       prompt: Type.String({
@@ -757,17 +755,39 @@ Modes (via the 'lite' parameter):
   pi.registerTool({
     name: "subagent_remove",
     description:
-      "Remove a subagent (`#N` or bare `N`) or a whole chain (`CN`). Kills the running step if active. `CN` removes the entire chain (one aborted summary). `#N` belonging to a still-running chain is guarded — remove the whole chain via its `C` id instead.",
+      "Stop and clean up a subagent you no longer need (running, blocked, done, or error) — kills it if active and removes its run dir (~/.pi/agent/runs/<id>/). Pass `id` (#N or N, or a chain CN) to remove one; omit `id` to clear all of YOUR OWN spawned subagents (origin 'agent') only — never the user's. The user's /subclear clears everything regardless.",
     parameters: Type.Object({
-      id: Type.Union(
-        [Type.Number(), Type.String()],
-        {
-          description: "Target id: a subagent `#N` (or bare `N`), or a chain `CN`.",
-        },
+      id: Type.Optional(
+        Type.Union(
+          [Type.Number(), Type.String()],
+          {
+            description: "Target id: a subagent `#N` (or bare `N`), or a chain `CN`. Omit to clear all of your own (origin 'agent') subagents.",
+          },
+        ),
       ),
     }),
     execute: async (callId, args, _signal, _onUpdate, ctx) => {
       widgetCtx = ctx;
+      // Q6: no id -> clear-all scoped to origin 'agent' (the LLM's own spawns;
+      // never user-spawned). Skips chain-step SubStates (remove those via CN).
+      if (args.id === undefined) {
+        let reaped = 0;
+        for (const [sid, s] of Array.from(agents.entries())) {
+          if (s.origin !== "agent" || s.chainId !== undefined) continue;
+          if (s.proc && s.status === "running") terminateProcessGroup(s.proc);
+          ctx.ui.setWidget(`sub-${sid}`, undefined);
+          removeRunDir(s.runDir);
+          cleanupWorktree(s.worktree, true);
+          agents.delete(sid);
+          reaped++;
+        }
+        updateWidgets();
+        return {
+          content: [
+            { type: "text", text: reaped === 0 ? "No subagents of yours to remove." : `Removed ${reaped} of your subagent${reaped !== 1 ? "s" : ""}.` },
+          ],
+        };
+      }
       const res = removeTarget(ctx, args.id);
       return {
         content: [
@@ -777,255 +797,11 @@ Modes (via the 'lite' parameter):
     },
   });
 
-  pi.registerTool({
-    name: "subagent_list",
-    description:
-      "List all active and finished subagents (IDs, tasks, mode, status) and running chains (C-id, step progress).",
-    parameters: Type.Object({}),
-    execute: async (_callId, _args, _signal, _onUpdate, ctx) => {
-      return { content: [{ type: "text", text: buildList(ctx) }] };
-    },
-  });
-
-  pi.registerTool({
-    name: "subagent_inspect",
-    description:
-      "Return a plain-text transcript of a subagent's run (the prompt it received + the assistant text + tool calls with args/results) so the agent can review how a subagent got its result. `#N` (or bare `N`) for one subagent; `CN` for all steps of a chain concatenated; `CN@step` for one step. The /subinspect COMMAND opens the live TUI panel for the user instead; this tool is text-only and works in any mode.",
-    parameters: Type.Object({
-      id: Type.Union(
-        [Type.Number(), Type.String()],
-        {
-          description: "Target id: a subagent `#N` (or bare `N`), a chain `CN`, or a step `CN@step`.",
-        },
-      ),
-    }),
-    execute: async (_callId, args, _signal, _onUpdate, ctx) => {
-      widgetCtx = ctx;
-      const target = parseTargetId(args.id);
-      if (target.kind === "invalid") {
-        return { content: [{ type: "text", text: `Error: ${target.reason}` }] };
-      }
-      if (target.kind === "chain") {
-        const chain = chains.get(target.chainId);
-        if (!chain) {
-          return { content: [{ type: "text", text: `Error: No chain C${target.chainId} found.` }] };
-        }
-        // CN@step → one step's transcript; CN → all steps concatenated.
-        if (target.step !== undefined) {
-          const sid = chain.subagentIds[target.step - 1];
-          const st = sid !== undefined ? agents.get(sid) : undefined;
-          if (!st) {
-            return { content: [{ type: "text", text: `Error: Step C${target.chainId}@${target.step} has no subagent record.` }] };
-          }
-          return { content: [{ type: "text", text: transcriptText(st) }] };
-        }
-        if (chain.steps.length === 0 || chain.subagentIds.length === 0) {
-          return { content: [{ type: "text", text: `Chain C${chain.id} has no spawned steps.` }] };
-        }
-        const parts: string[] = [
-          `chain C${chain.id} "${chain.name}" [${chain.status}] · ${chain.subagentIds.length}/${chain.steps.length} steps${chain.aborted ? " · aborted" : ""}`,
-          "",
-        ];
-        for (let i = 0; i < chain.subagentIds.length; i++) {
-          const sid = chain.subagentIds[i];
-          const st = agents.get(sid);
-          parts.push(`━━━ step ${i + 1}/${chain.steps.length}: ${chain.steps[i].agent} (#${sid}) ━━━`);
-          parts.push(st ? transcriptText(st) : "(no subagent record)");
-          parts.push("");
-        }
-        return { content: [{ type: "text", text: parts.join("\n") }] };
-      }
-      const id = target.id;
-      const state = agents.get(id);
-      if (!state) {
-        return { content: [{ type: "text", text: `Error: No subagent #${id} found.` }] };
-      }
-      return { content: [{ type: "text", text: transcriptText(state) }] };
-    },
-  });
-
-  // ── subagent_catalog (orchestration discovery, spec §5.3) ───────────
-  pi.registerTool({
-    name: "subagent_catalog",
-    description:
-      "Discover named agents (~/.pi/agent/agents/*.md) AND chain templates (~/.pi/agent/chains/*.yaml). Returns each agent's name + one-line description, and each chain's name + description + agent sequence. Read fresh on every call (edits take effect immediately). Call this before orchestrating multi-agent workflows so you know which named agents and chains exist. Does NOT return system prompts, tools, or step task text.",
-    parameters: Type.Object({
-      scope: Type.Optional(
-        Type.Union(
-          [Type.Literal("user"), Type.Literal("project"), Type.Literal("both")],
-          {
-            description:
-              'Which directories to search (agents + chains). "user" = ~/.pi/agent/ only (default). "project" = nearest .pi/ only. "both" = user + project (project overrides same-name).',
-          },
-        ),
-      ),
-    }),
-    execute: async (_callId, args, _signal, _onUpdate, ctx) => {
-      const requested = (args.scope ?? "user") as "user" | "project" | "both";
-      // R5 (8.2/6.4): gate project scope before discovery — listing ≠ running,
-      // but project agent/chain names+descriptions are repo-controlled metadata
-      // that shouldn't surface to the model without the user's trust confirm.
-      // Gate is repo-scoped (covers both agents + chains in one prompt); non-TUI
-      // programmatic calls collapse to "user" (deny by default).
-      const scope = await gateProjectScope(ctx, requested);
-      const { agents } = discoverAgents(ctx.cwd, scope);
-      const { chains } = discoverChains(ctx.cwd, scope);
-      const sections: string[] = [];
-      if (agents.length > 0) {
-        sections.push(
-          `## Agents (${scope})\n${agents
-            .map((a) => `- ${a.name} (${a.source}): ${a.description}`)
-            .join("\n")}`,
-        );
-      }
-      if (chains.length > 0) {
-        sections.push(
-          `## Chains (${scope})\n${chains
-            .map(
-              (c) =>
-                `- ${c.name} (${c.source}): ${c.description} [${c.steps
-                  .map((s) => s.agent)
-                  .join(" → ")}]`,
-            )
-            .join("\n")}`,
-        );
-      }
-      if (sections.length === 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `No agents or chains found (scope: ${scope}). Define agents as markdown files under ~/.pi/agent/agents/ (frontmatter: name + description required; optional: tools, disallowedTools, model, extensions, skills; body = system prompt), and chains as YAML under ~/.pi/agent/chains/ (frontmatter: name + description + steps:[{agent,task}]).`,
-            },
-          ],
-        };
-      }
-      return {
-        content: [{ type: "text", text: sections.join("\n\n") }],
-      };
-    },
-  });
-
-  // ── subagent_build (agent authoring, spec §5.4) ─────────────────────
-  // Build (or overwrite) a named agent file at ~/.pi/agent/agents/<name>.md.
-  // Lets the orchestrating model scaffold a reusable agent when the user asks,
-  // instead of hand-writing the file via raw `write`. Writing a file is inert
-  // until a trusted user run EXECUTES it — so this needs no trust gate (project
-  // execution gates already cover the threat; building ≠ spawning, so there's
-  // no recursion vector either — and subagent-widget is excluded from children
-  // by DEFAULT_DISALLOWED_EXT, so a subagent can't reach this tool anyway).
-  // Self-verifies: re-discovers the written file + confirms the round-trip.
-  pi.registerTool({
-    name: "subagent_build",
-    description:
-      "Write (or overwrite with force) a named agent definition to ~/.pi/agent/agents/<name>.md so it becomes discoverable via subagent_catalog and spawnable via /sub <name> or as a chain step. Use this when the user asks to build/create/make a new agent. Validated: name must match ^[a-z0-9][a-z0-9-]*$ (lowercase, hyphens, alphanumerics). Required: name, description, systemPrompt (the body — the agent's role/prompt). Optional overlay fields: tools (allowlist), disallowedTools (denylist), model, extensions (additive -e), skills (additive --skill), worktree (force git isolation). After writing, verifies the file parses + is discoverable.",
-    parameters: Type.Object({
-      name: Type.String({
-        description: "Agent name. Must match ^[a-z0-9][a-z0-9-]*$ (lowercase, hyphens, alphanumerics; e.g. 'scout', 'api-reviewer'). Becomes the filename `<name>.md`.",
-      }),
-      description: Type.String({
-        description: "One-line description shown in subagent_catalog + /subchain picker. Keep it short + specific.",
-      }),
-      systemPrompt: Type.String({
-        description: "The agent's system prompt (body of the .md file). Define the role, mindset, constraints. Multi-line is fine.",
-      }),
-      tools: Type.Optional(
-        Type.Array(Type.String(), {
-          description: "Optional tool allowlist → --tools (e.g. ['read','grep','ls']). When omitted, the mode's default toolset applies.",
-        }),
-      ),
-      disallowedTools: Type.Optional(
-        Type.Array(Type.String(), {
-          description: "Optional tool denylist → --exclude-tools (applied after `tools` allowlist).",
-        }),
-      ),
-      model: Type.Optional(
-        Type.String({
-          description: "Optional model override (supports provider/id:thinking form, e.g. 'neuralwatt/glm-5.2-short').",
-        }),
-      ),
-      extensions: Type.Optional(
-        Type.Array(Type.String(), {
-          description: "Optional additive extensions → -e (e.g. ['npm:pi-neuralwatt-provider']). Never drops the neuralwatt provider; can't re-load subagent-widget (recursion guard).",
-        }),
-      ),
-      skills: Type.Optional(
-        Type.Array(Type.String(), {
-          description: "Optional additive skills → --skill (paths or names).",
-        }),
-      ),
-      worktree: Type.Optional(
-        Type.Boolean({
-          description: "If true, force git-worktree isolation for this agent even when config worktree is 'off'. Applies to chain steps (standalone spawns are anonymous).",
-        }),
-      ),
-      force: Type.Optional(
-        Type.Boolean({
-          description: "Overwrite if an agent with this name already exists. Default false (refuse + report the existing agent's description).",
-        }),
-      ),
-    }),
-    execute: async (_callId, args, _signal, _onUpdate, ctx) => {
-      const name = (args.name ?? "").trim();
-      const description = (args.description ?? "").trim();
-      const systemPrompt = args.systemPrompt ?? "";
-      if (!/^[a-z0-9][a-z0-9-]*$/.test(name)) {
-        return { content: [{ type: "text", text: `Error: name "${name || "(empty)"}" is invalid. Must match ^[a-z0-9][a-z0-9-]*$ (lowercase, hyphens, alphanumerics; must start alnum).` }] };
-      }
-      if (!description) return { content: [{ type: "text", text: "Error: description is required (one-line, shown in catalog)." }] };
-      if (!systemPrompt.trim()) return { content: [{ type: "text", text: "Error: systemPrompt is required (the agent's role/prompt)." }] };
-
-      const agentDir = path.join(getAgentDir(), "agents");
-      const filePath = path.join(agentDir, `${name}.md`);
-
-      // Overwrite safety: refuse unless force opt-in (mirrors /subrm's force
-      // pattern — neither silent clobber nor a forced re-prompt).
-      if (fs.existsSync(filePath)) {
-        if (!args.force) {
-          const existing = discoverAgents(ctx.cwd, "user").agents.find((a) => a.name === name);
-          return { content: [{ type: "text", text: `Error: agent "${name}" already exists at ${filePath}.${existing ? ` Description: "${existing.description}".` : ""} Pass force: true to overwrite.` }] };
-        }
-      }
-
-      // Build frontmatter — only emit provided fields. List fields comma-
-      // separated (matches parseListField + the scout.md canonical form).
-      const fm: string[] = [`name: ${name}`, `description: ${description}`];
-      if (args.tools?.length) fm.push(`tools: ${args.tools.join(", ")}`);
-      if (args.disallowedTools?.length) fm.push(`disallowedTools: ${args.disallowedTools.join(", ")}`);
-      if (args.model) fm.push(`model: ${args.model}`);
-      if (args.extensions?.length) fm.push(`extensions: ${args.extensions.join(", ")}`);
-      if (args.skills?.length) fm.push(`skills: ${args.skills.join(", ")}`);
-      if (args.worktree) fm.push(`worktree: true`);
-      const body = `---\n${fm.join("\n")}\n---\n${systemPrompt.replace(/\n$/, "")}\n`;
-
-      try {
-        fs.mkdirSync(agentDir, { recursive: true });
-        fs.writeFileSync(filePath, body, { encoding: "utf-8", mode: 0o600 });
-      } catch (err: any) {
-        return { content: [{ type: "text", text: `Error writing ${filePath}: ${err?.message ?? err}` }] };
-      }
-
-      // Self-verify: re-discover + confirm the file parses + round-trips.
-      const verified = discoverAgents(ctx.cwd, "user").agents.find((a) => a.name === name);
-      if (!verified) {
-        return { content: [{ type: "text", text: `Error: wrote ${filePath} but it did NOT parse / was not discovered. Check the frontmatter syntax.` }] };
-      }
-      const overlay: string[] = [];
-      if (verified.tools?.length) overlay.push(`tools=[${verified.tools.join(",")}]`);
-      if (verified.disallowedTools?.length) overlay.push(`disallowedTools=[${verified.disallowedTools.join(",")}]`);
-      if (verified.model) overlay.push(`model=${verified.model}`);
-      if (verified.extensions?.length) overlay.push(`extensions=[${verified.extensions.join(",")}]`);
-      if (verified.skills?.length) overlay.push(`skills=[${verified.skills.join(",")}]`);
-      if (verified.worktree) overlay.push(`worktree=true`);
-      return { content: [{ type: "text", text: `✓ Agent "${name}" ${fs.existsSync(filePath) && args.force ? "(overwrote)" : ""}written to ${filePath}.\nDiscoverable via subagent_catalog; spawn via /sub ${name} <task> or as a chain step (agent: ${name}).\nParsed back as: description="${verified.description}"${overlay.length ? " · " + overlay.join(" ") : ""}.` }] };
-    },
-  });
-
   // ── orchestrate tool (orchestration, spec §5.2 — Mode 2 LLM trigger) ──
   pi.registerTool({
     name: "orchestrate",
     description:
-      "Run a multi-agent chain in the background (auto-advance, fire-and-forget). The final result is delivered as a follow-up message when the chain completes or halts, so you can continue other work or stop your turn in the meantime. Pass exactly one of: `template` (named chain from ~/.pi/agent/chains/), `steps` (inline LLM-authored step list referencing named agents), or `chains` (run multiple). `template` wins over `steps` if both set. Agents & templates are discoverable via the `subagent_catalog` tool — call it before authoring `steps` or using `template`.",
+      "Run a multi-agent chain in the background (auto-advance, fire-and-forget). The final result is delivered as a follow-up message when the chain completes or halts. Pass exactly one of: `template` (named chain from ~/.pi/agent/chains/*.yaml), `steps` (inline step list referencing named agents), or `chains` (run multiple). `template` wins over `steps` if both set. Named agents live as files at ~/.pi/agent/agents/*.md and chains at ~/.pi/agent/chains/*.yaml — `ls` them before authoring `steps` or using a `template`. Chain steps run fire-and-forget and can't ask mid-run (the `??` answer channel has no route in a pipeline); if a step needs input, spawn it standalone via `subagent_create` instead.",
     parameters: Type.Object({
       template: Type.Optional(
         Type.String({
@@ -1036,7 +812,7 @@ Modes (via the 'lite' parameter):
         Type.Array(
           Type.Object({
             agent: Type.String({
-              description: "Name of a defined agent (reference only — discovered via subagent_catalog).",
+              description: "Name of a defined agent (a file under ~/.pi/agent/agents/*.md).",
             }),
             task: Type.String({
               description: "Task for this step. Use {previous} for the prior step's output and {input} for the chain input.",
@@ -1745,7 +1521,7 @@ Modes (via the 'lite' parameter):
         return;
       }
       // First-token-if-matches: if the first word is a known named agent
-      // (user+project, matching subagent_catalog), treat it as the agent-def
+      // (user+project, matching ~/.pi/agent/agents/*.md), treat it as the agent-def
       // and the remainder as the task. Otherwise the whole string is a bare
       // task (backward compatible). lite is blocked from named agents: an
       // agent's extensions would bypass --no-extensions via explicit -e,
