@@ -1538,10 +1538,16 @@ Modes (via the 'lite' parameter):
     const sections: string[] = [];
     if (agents.size > 0) {
       const list = Array.from(agents.values())
-        .map(
-          (s) =>
-            `#${s.id} [${s.status.toUpperCase()}]${s.lite ? " (lite)" : ""}${s.chainId !== undefined ? ` (chain C${s.chainId})` : ""} (Turn ${s.turnCount}) - ${s.task.length > 60 ? s.task.slice(0, 57) + "..." : s.task}`,
-        )
+        .map((s) => {
+          // Q11: blocked shows "blocked: <pending-question preview>" instead of
+          // the task preview; the [BLOCKED] tag + ⧗ icon both carry the state.
+          if (s.status === "blocked" && s.pendingRequest) {
+            const q = s.pendingRequest.question;
+            const qprev = q.length > 50 ? q.slice(0, 47) + "..." : q;
+            return `#${s.id} [BLOCKED]${s.lite ? " (lite)" : ""}${s.chainId !== undefined ? ` (chain C${s.chainId})` : ""} (Turn ${s.turnCount}) - ${qprev}`;
+          }
+          return `#${s.id} [${s.status.toUpperCase()}]${s.lite ? " (lite)" : ""}${s.chainId !== undefined ? ` (chain C${s.chainId})` : ""} (Turn ${s.turnCount}) - ${s.task.length > 60 ? s.task.slice(0, 57) + "..." : s.task}`;
+        })
         .join("\n");
       sections.push(`Subagents:\n${list}`);
     }
@@ -1592,7 +1598,9 @@ Modes (via the 'lite' parameter):
           ? "●"
           : st.status === "done"
             ? "✓"
-            : "✗";
+            : st.status === "blocked"
+              ? "⧗"
+              : "✗";
       const task = s.task.length > 40 ? s.task.slice(0, 37) + "…" : s.task;
       return `${icon} Step ${i + 1}: ${s.agent} · ${task}`;
     });
@@ -1906,7 +1914,7 @@ Modes (via the 'lite' parameter):
       }
       const options = Array.from(agents.values()).map(
         (s) =>
-          `#${s.id} ${s.status === "running" ? "●" : s.status === "done" ? "✓" : "✗"}${s.lite ? " ⚡" : ""} · ${
+          `#${s.id} ${s.status === "running" ? "●" : s.status === "done" ? "✓" : s.status === "blocked" ? "⧗" : "✗"}${s.lite ? " ⚡" : ""} · ${
             s.task.length > 40 ? s.task.slice(0, 37) + "…" : s.task
           }`,
       );

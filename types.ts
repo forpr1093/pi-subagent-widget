@@ -29,7 +29,7 @@ export type SubagentOrigin = "user" | "agent";
 
 export interface SubState {
   id: number;
-  status: "running" | "done" | "error";
+  status: "running" | "done" | "error" | "blocked";
   task: string;
   events: InspectorEvent[]; // single source of truth for the current turn
   toolIndex: Map<string, number>; // toolCallId → events index (in-place patching)
@@ -50,6 +50,11 @@ export interface SubState {
                     // shared tree). Owned here so /subrm + session_start can clean it.
                     // Chain steps carry NO worktree field — the ChainState owns it.
   proc?: any; // active ChildProcess ref (for kill on /subrm)
+  // Q11: set when status flips running->blocked (a "??" yield). Derived
+  // pointer maintained by the status machine so inspector / /sublist / the
+  // subagent-request followUp all read it in O(1) — NOT a re-scan of events.
+  // Cleared on blocked->running (answered) and blocked->done|error (reaped).
+  pendingRequest?: { question: string; askedAt: number };
 }
 
 /** Coordinator record for one running chain (spec §7.1). Thin: does not render

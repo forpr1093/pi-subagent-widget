@@ -162,9 +162,19 @@ export function buildInspectorLines(
 export function transcriptText(state: SubState): string {
   const lines: string[] = [];
   const toolCount = state.events.filter((e) => e.kind === "tool").length;
-  lines.push(
-    `subagent #${state.id} [${state.status}]${state.lite ? " lite" : ""} · turn ${state.turnCount} · ${Math.round(state.elapsed / 1000)}s · ${toolCount} tool${toolCount === 1 ? "" : "s"}`,
-  );
+  // Q11: a blocked subagent yields "asking: <pending>" instead of the elapsed/
+  // tool tail, reading the derived pendingRequest field (null-guarded — empty
+  // until the step-5 detection writes it).
+  if (state.status === "blocked" && state.pendingRequest) {
+    const preview = truncateField(state.pendingRequest.question, 80);
+    lines.push(
+      `subagent #${state.id} [blocked]${state.lite ? " lite" : ""} · turn ${state.turnCount} · asking: ${preview}`,
+    );
+  } else {
+    lines.push(
+      `subagent #${state.id} [${state.status}]${state.lite ? " lite" : ""} · turn ${state.turnCount} · ${Math.round(state.elapsed / 1000)}s · ${toolCount} tool${toolCount === 1 ? "" : "s"}`,
+    );
+  }
   if (state.task.trim()) {
     lines.push("task:");
     for (const raw of state.task.split("\n")) lines.push("  " + raw);
@@ -320,19 +330,27 @@ export class InspectorComponent {
         ? "accent"
         : this.state.status === "done"
           ? "success"
-          : "error";
+          : this.state.status === "blocked"
+            ? "warning"
+            : "error";
     const si =
       this.state.status === "running"
         ? "●"
         : this.state.status === "done"
           ? "✓"
-          : "✗";
+          : this.state.status === "blocked"
+            ? "⧗"
+            : "✗";
     const toolCount = this.state.events.filter((e) => e.kind === "tool").length;
+    const askingTail =
+      this.state.status === "blocked" && this.state.pendingRequest
+        ? `  asking: ${truncateField(this.state.pendingRequest.question, 60)}`
+        : "";
     const head =
       ` Subagent #${this.state.id}  ${si} ${this.state.status}` +
       (this.state.lite ? "  ⚡lite" : "") +
       (this.state.turnCount > 1 ? `  · Turn ${this.state.turnCount}` : "") +
-      `  ${Math.round(this.state.elapsed / 1000)}s  Tools: ${toolCount} `;
+      `  ${Math.round(this.state.elapsed / 1000)}s  Tools: ${toolCount} ${askingTail}`;
 
     const pos = `${this.offset}/${maxOff}${
       this.autoFollow ? "" : "  [follow paused]"
