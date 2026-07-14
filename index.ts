@@ -130,6 +130,38 @@ function parseTargetId(raw: string | number): TargetId {
   return { kind: "invalid", reason: `"${raw}" is not a #N or CN id` };
 }
 
+/** Q3: kill a subagent's whole process group (graceful SIGTERM → forced SIGKILL
+ *  after ~5s). The child was spawned detached:true so it (and every process it
+ *  spawned) share one process group rooted at proc.pid; a negative pid kills the
+ *  entire group at once, so grandchildren (git, npm, dev servers) die with the
+ *  worker instead of orphaning (holding file locks + worktrees). Mirrors pi's
+ *  own exec.js graceful→forced pattern. On Windows (no setsid) falls back to a
+ *  direct proc.kill. Best-effort: a kill failure must never crash the extension. */
+function terminateProcessGroup(proc: any) {
+  if (!proc || proc.pid === undefined) return;
+  const pid = proc.pid;
+  const win32 = process.platform === "win32";
+  const killGroup = (sig: NodeJS.Signals) => {
+    if (win32) { proc.kill(sig); return; }
+    try {
+      process.kill(-pid, sig);
+    } catch (err: any) {
+      // ESRCH = group already gone (normal if it closed); fall back to direct.
+      try { proc.kill(sig); } catch {}
+    }
+  };
+  killGroup("SIGTERM");
+  const guard = setTimeout(() => {
+    try {
+      if (!win32) process.kill(-pid, "SIGKILL");
+      else proc.kill("SIGKILL");
+    } catch {
+      // already dead — nothing to do.
+    }
+  }, 5000);
+  guard.unref?.();
+}
+
 export default function (pi: ExtensionAPI) {
   const agents: Map<number, SubState> = new Map();
   let nextId = 1;
@@ -325,11 +357,19 @@ export default function (pi: ExtensionAPI) {
     args.push(safePrompt);
 
     return new Promise((resolve) => {
+      // Q3: detached:true → child calls setsid() and becomes a process-group
+      // leader (every process it spawns joins that group). Lets us kill the
+      // WHOLE tree via process.kill(-pid) instead of orphaning grandchildren
+      // (git, npm, tsx, dev servers) that hold file locks + worktrees. Skipped
+      // on Windows (no setsid; process.kill(-pid) semantics differ) — falls
+      // back to the direct SIGTERM there. We do NOT unref(): we still read
+      // stdout + await close in this process.
       const proc = spawn("pi", args, {
         cwd: childCwd,
         stdio: ["ignore", "pipe", "pipe"],
         env: { ...process.env },
         shell: process.platform === "win32",
+        detached: process.platform !== "win32",
       });
       state.proc = proc;
       const startTime = Date.now();
@@ -1350,7 +1390,7 @@ Modes (via the 'lite' parameter):
     chain.status = "aborted";
     for (const sid of chain.subagentIds) {
       const s = agents.get(sid);
-      if (s?.proc && s.status === "running") s.proc.kill("SIGTERM");
+      if (s?.proc && s.status === "running") terminateProcessGroup(s.proc);
     }
     const doneNames = chain.subagentIds
       .map((sid, idx) =>
@@ -1441,7 +1481,7 @@ Modes (via the 'lite' parameter):
         };
     }
     const wasRunning = !!(state.proc && state.status === "running");
-    if (wasRunning) state.proc.kill("SIGTERM");
+    if (wasRunning) terminateProcessGroup(state.proc);
     ctx.ui.setWidget(`sub-${id}`, undefined);
     removeRunDir(state.runDir);
     cleanupWorktree(state.worktree, true); // §12: explicit /subrm #N force-removes a dirty standalone tree
@@ -1783,7 +1823,7 @@ Modes (via the 'lite' parameter):
       let killed = 0;
       for (const [id, state] of Array.from(agents.entries())) {
         if (state.proc && state.status === "running") {
-          state.proc.kill("SIGTERM");
+          terminateProcessGroup(state.proc);
           killed++;
         }
         ctx.ui.setWidget(`sub-${id}`, undefined);
@@ -2018,7 +2058,7 @@ Modes (via the 'lite' parameter):
   pi.on("session_start", async (_event, ctx) => {
     for (const [id, state] of Array.from(agents.entries())) {
       if (state.proc && state.status === "running") {
-        state.proc.kill("SIGTERM");
+        terminateProcessGroup(state.proc);
       }
       ctx.ui.setWidget(`sub-${id}`, undefined);
       removeRunDir(state.runDir);
