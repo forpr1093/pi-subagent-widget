@@ -40,7 +40,6 @@ import { getAgentDir, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import type {
   ChainState,
@@ -49,7 +48,15 @@ import type {
   SubagentOrigin,
 } from "./types.ts";
 import { appendText, cap, openInspector, stringifyVal, transcriptText } from "./inspector.ts";
-import { deleteSessionFile, makeSessionFile } from "./session.ts";
+import { makeSessionFile } from "./session.ts";
+import {
+  createRunDir,
+  removeRunDir,
+  runDirPath,
+  writePromptFile,
+  writeResultFile,
+  type RunMeta,
+} from "./rundir.ts";
 import { loadDisallowedExtensions, loadLiteExtensions, loadWorktreeMode, NEURALWATT_PROVIDER } from "./config.ts";
 import { effectiveDisallowedExtensions, normalizeForMatch, resolveFullModeExtArgs } from "./disallow.ts";
 import { buildChainWidget, buildSubagentWidget } from "./widget.ts";
@@ -71,44 +78,17 @@ import {
   type Worktree,
 } from "./worktree.ts";
 
-/** Write an agent-def system prompt body to a temp file (spec §3.3). pi's
- *  --append-system-prompt reads the file (resolvePromptInput treats an existing
- *  path as a file). Caller cleans up via cleanupAgentPromptFile. */
-function writeAgentPromptFile(
-  agentName: string,
-  body: string,
-): { dir: string; path: string } {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
-  const safeName = agentName.replace(/[^\w.-]+/g, "_");
-  const filePath = path.join(dir, `prompt-${safeName}.md`);
-  fs.writeFileSync(filePath, body, { encoding: "utf-8", mode: 0o600 });
-  return { dir, path: filePath };
-}
-
-/** Best-effort cleanup of the temp prompt file + its dir. Swallows ENOENT. */
-function cleanupAgentPromptFile(p: { dir: string; path: string } | null) {
-  if (!p) return;
-  try {
-    fs.unlinkSync(p.path);
-  } catch {}
-  try {
-    fs.rmdirSync(p.dir);
-  } catch {}
-}
-
 /** R6: deliver full subagent/chain results without lossy truncation. If the
  *  text fits the inline budget (8000 chars), return it verbatim. Otherwise spill
- *  the FULL text to a temp file (mode 0o600) and return an 8000-char prefix + a
- *  pointer — so the orchestrator can `read` the rest on demand instead of
- *  working with a truncated tail (this is what bit the reviewer subagents).
- *  Matches pi's own spill-to-temp-file pattern for large responses. */
+ *  the FULL text to result.txt INSIDE the run dir (Q2 — was orphaned in $TMPDIR,
+ *  now reaped with the run) and return an 8000-char prefix + a pointer, so the
+ *  orchestrator can `read` the rest on demand instead of working with a
+ *  truncated tail (this is what bit the reviewer subagents). */
 const RESULT_INLINE_BUDGET = 8000;
-function spillResult(text: string): string {
+function spillResult(text: string, runDir: string): string {
   if (text.length <= RESULT_INLINE_BUDGET) return text;
   try {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-result-"));
-    const filePath = path.join(dir, "result.txt");
-    fs.writeFileSync(filePath, text, { encoding: "utf-8", mode: 0o600 });
+    const filePath = writeResultFile(runDir, text);
     return (
       text.slice(0, RESULT_INLINE_BUDGET) +
       `\n\n... [full result (${text.length} chars) written to: ${filePath} — read it for the complete output]`
@@ -312,7 +292,7 @@ export default function (pi: ExtensionAPI) {
     const subagentContext =
       `[Subagent context]\n` +
       `You are a subagent — a background agent spawned by ${originLabel} to perform a delegated task. You are not the main agent and do not interact with the user directly. Work autonomously on the task; when finished, your final output is returned to ${originLabel} automatically.`;
-    let promptTmp: { dir: string; path: string } | null = null;
+    let promptPath: string | null = null;
     if (agentConfig) {
       for (const f of agentConfigFlags(agentConfig)) args.push(f);
     }
@@ -323,9 +303,11 @@ export default function (pi: ExtensionAPI) {
     bodyParts.push(subagentContext);
     if (chainContext?.trim()) bodyParts.push(chainContext.trim());
     const body = bodyParts.join("\n\n");
+    // Q2: the --append-system-prompt body lives as prompt.md inside the run dir
+    // (was a mkdtemp temp file that leaked on crash). Reaped with the run.
     if (body.trim()) {
-      promptTmp = writeAgentPromptFile(agentConfig?.name ?? "subagent", body);
-      args.push("--append-system-prompt", promptTmp.path);
+      promptPath = writePromptFile(state.runDir, body);
+      args.push("--append-system-prompt", promptPath);
     }
 
     // B2/R2: the prompt is the final positional arg. pi's argv parser eats a
@@ -420,7 +402,7 @@ export default function (pi: ExtensionAPI) {
             pi.sendMessage(
               {
                 customType: "subagent-result",
-                content: `${state.origin === "user" ? " (This agent was created by User)\n\n" : ""}Subagent #${state.id}${state.lite ? " (⚡lite)" : ""}${state.turnCount > 1 ? ` (Turn ${state.turnCount})` : ""} finished "${prompt}" in ${Math.round(state.elapsed / 1000)}s.\n\nResult:\n${spillResult(result)}`,
+                content: `${state.origin === "user" ? " (This agent was created by User)\n\n" : ""}Subagent #${state.id}${state.lite ? " (⚡lite)" : ""}${state.turnCount > 1 ? ` (Turn ${state.turnCount})` : ""} finished "${prompt}" in ${Math.round(state.elapsed / 1000)}s.\n\nResult:\n${spillResult(result, state.runDir)}`,
                 display: true,
               },
               { deliverAs: "followUp", triggerTurn: true },
@@ -431,7 +413,8 @@ export default function (pi: ExtensionAPI) {
           // aggregate (complete/failed/aborted) followUp + auto-advances (spec §7.3).
           onChainStepClose(state, ctx);
         }
-        cleanupAgentPromptFile(promptTmp);
+        // Q2: prompt.md lives inside state.runDir — reaped with the run, no
+        // separate temp cleanup needed.
         resolve();
       });
       proc.on("error", (err) => {
@@ -440,7 +423,6 @@ export default function (pi: ExtensionAPI) {
         state.proc = undefined;
         appendText(state, `Error: ${err.message}`);
         updateWidgets();
-        cleanupAgentPromptFile(promptTmp);
         resolve();
       });
     });
@@ -511,6 +493,14 @@ Modes (via the 'lite' parameter):
       }
       const id = nextId++;
       const wt = maybeCreateWorktree(ctx, "pi-sub", id);
+      const runDir = createRunDir(id, {
+        id,
+        origin: "agent",
+        agent: agentConfig?.name,
+        lite,
+        spawnTime: Date.now(),
+        parentPid: process.pid,
+      });
       const state: SubState = {
         id,
         status: "running",
@@ -518,7 +508,8 @@ Modes (via the 'lite' parameter):
         events: [],
         toolIndex: new Map(),
         elapsed: 0,
-        sessionFile: makeSessionFile(id),
+        runDir,
+        sessionFile: makeSessionFile(runDir),
         turnCount: 1,
         lite,
         origin: "agent",
@@ -1215,6 +1206,15 @@ Modes (via the 'lite' parameter):
     }
     task = task.replaceAll("{input}", chain.input);
     const id = nextId++;
+    const stepAgent = agent.name;
+    const runDir = createRunDir(id, {
+      id,
+      origin: "agent",
+      agent: stepAgent,
+      lite: chain.lite,
+      spawnTime: Date.now(),
+      parentPid: process.pid,
+    });
     const stepState: SubState = {
       id,
       status: "running",
@@ -1222,7 +1222,8 @@ Modes (via the 'lite' parameter):
       events: [],
       toolIndex: new Map(),
       elapsed: 0,
-      sessionFile: makeSessionFile(id),
+      runDir,
+      sessionFile: makeSessionFile(runDir),
       turnCount: 1,
       lite: chain.lite,
       origin: "agent",
@@ -1303,7 +1304,7 @@ Modes (via the 'lite' parameter):
     pi.sendMessage(
       {
         customType: "chain-result",
-        content: `Chain C${chain.id} "${chain.name}" complete (${chain.steps.length}/${chain.steps.length} steps).\nFinal result (${lastAgent}):\n${spillResult(finalText)}\n${perStepWithTools}.${chain.worktree ? `\nWorktree: ${chain.worktree.path} (branch ${chain.worktree.branch}).` : ""}`,
+        content: `Chain C${chain.id} "${chain.name}" complete (${chain.steps.length}/${chain.steps.length} steps).\nFinal result (${lastAgent}):\n${spillResult(finalText, lastState?.runDir ?? runDirPath(chain.subagentIds[chain.subagentIds.length - 1] ?? -1))}\n${perStepWithTools}.${chain.worktree ? `\nWorktree: ${chain.worktree.path} (branch ${chain.worktree.branch}).` : ""}`,
         display: true,
       },
       { deliverAs: "followUp", triggerTurn: true },
@@ -1384,7 +1385,7 @@ Modes (via the 'lite' parameter):
     for (const sid of chain.subagentIds) {
       ctx.ui.setWidget(`sub-${sid}`, undefined);
       const s = agents.get(sid);
-      if (s) deleteSessionFile(s);
+      if (s) removeRunDir(s.runDir);
       agents.delete(sid);
     }
     ctx.ui.setWidget(`chain-${chain.id}`, undefined);
@@ -1418,7 +1419,7 @@ Modes (via the 'lite' parameter):
         const s = agents.get(sid);
         if (s) {
           ctx.ui.setWidget(`sub-${sid}`, undefined);
-          deleteSessionFile(s);
+          removeRunDir(s.runDir);
           agents.delete(sid);
         }
         updateWidgets(); // refresh the chain box so the removed step row disappears
@@ -1442,7 +1443,7 @@ Modes (via the 'lite' parameter):
     const wasRunning = !!(state.proc && state.status === "running");
     if (wasRunning) state.proc.kill("SIGTERM");
     ctx.ui.setWidget(`sub-${id}`, undefined);
-    deleteSessionFile(state);
+    removeRunDir(state.runDir);
     cleanupWorktree(state.worktree, true); // §12: explicit /subrm #N force-removes a dirty standalone tree
     agents.delete(id);
     updateWidgets(); // if this was a step of a finished chain, refresh that box
@@ -1606,6 +1607,14 @@ Modes (via the 'lite' parameter):
       }
       const id = nextId++;
       const wt = maybeCreateWorktree(ctx, "pi-sub", id);
+      const runDir = createRunDir(id, {
+        id,
+        origin: "user",
+        agent: agentConfig?.name,
+        lite: false,
+        spawnTime: Date.now(),
+        parentPid: process.pid,
+      });
       const state: SubState = {
         id,
         status: "running",
@@ -1613,7 +1622,8 @@ Modes (via the 'lite' parameter):
         events: [],
         toolIndex: new Map(),
         elapsed: 0,
-        sessionFile: makeSessionFile(id),
+        runDir,
+        sessionFile: makeSessionFile(runDir),
         turnCount: 1,
         lite: false,
         origin: "user",
@@ -1652,6 +1662,13 @@ Modes (via the 'lite' parameter):
       const task = raw;
       const id = nextId++;
       const wt = maybeCreateWorktree(ctx, "pi-sub", id);
+      const runDir = createRunDir(id, {
+        id,
+        origin: "user",
+        lite: true,
+        spawnTime: Date.now(),
+        parentPid: process.pid,
+      });
       const state: SubState = {
         id,
         status: "running",
@@ -1659,7 +1676,8 @@ Modes (via the 'lite' parameter):
         events: [],
         toolIndex: new Map(),
         elapsed: 0,
-        sessionFile: makeSessionFile(id),
+        runDir,
+        sessionFile: makeSessionFile(runDir),
         turnCount: 1,
         lite: true,
         origin: "user",
@@ -1769,7 +1787,7 @@ Modes (via the 'lite' parameter):
           killed++;
         }
         ctx.ui.setWidget(`sub-${id}`, undefined);
-        deleteSessionFile(state);
+        removeRunDir(state.runDir);
         cleanupWorktree(state.worktree); // R3: clean-only — keep dirty + warn
       }
       for (const chain of Array.from(chains.values())) {
@@ -2003,7 +2021,7 @@ Modes (via the 'lite' parameter):
         state.proc.kill("SIGTERM");
       }
       ctx.ui.setWidget(`sub-${id}`, undefined);
-      deleteSessionFile(state);
+      removeRunDir(state.runDir);
       cleanupWorktree(state.worktree); // R3: clean slate for widgets/id — but clean-only so a dirty tree is KEPT + warned, not force-destroyed (force is for /subrm)
     }
     for (const chain of Array.from(chains.values())) {

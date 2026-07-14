@@ -34,7 +34,11 @@ export interface SubState {
   events: InspectorEvent[]; // single source of truth for the current turn
   toolIndex: Map<string, number>; // toolCallId → events index (in-place patching)
   elapsed: number;
-  sessionFile: string; // persistent JSONL session path — used by /subcont to resume
+  runDir: string; // Q2 — unified run dir (~/.pi/agent/runs/<id>/); holds
+                   // prompt.md / result.txt / session.jsonl / meta.json.
+                   // Reaped as a unit on removal + by the Q9 sweep.
+  sessionFile: string; // persistent JSONL session path (runDir/session.jsonl) —
+                       // used by /subcont to resume
   turnCount: number; // increments each time /subcont continues this agent
   lite: boolean; // whether this agent runs in lite mode (restricted tools, no thinking)
   origin: SubagentOrigin; // who initiated this subagent: "user" (/sub slash) or "agent" (subagent_create tool)
