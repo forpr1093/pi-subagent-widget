@@ -81,28 +81,22 @@ import {
   type Worktree,
 } from "./worktree.ts";
 
-/** R6: deliver full subagent/chain results without lossy truncation. If the
- *  text fits the inline budget (8000 chars), return it verbatim. Otherwise spill
- *  the FULL text to result.txt INSIDE the run dir (Q2 — was orphaned in $TMPDIR,
- *  now reaped with the run) and return an 8000-char prefix + a pointer, so the
- *  orchestrator can `read` the rest on demand instead of working with a
- *  truncated tail (this is what bit the reviewer subagents). */
+/** R6/Q7: deliver full subagent/chain results without lossy truncation.
+ *  If the text fits the inline budget (8000 chars), return it verbatim. Otherwise
+ *  spill the FULL text to result.txt INSIDE the run dir (Q2 — was orphaned in
+ *  $TMPDIR, now reaped with the run) and return an 8000-char prefix + the
+ *  spill path, so the orchestrator can `read` the rest on demand instead of
+ *  working with a truncated tail. Returns { body, spillPath? }. */
 const RESULT_INLINE_BUDGET = 8000;
-function spillResult(text: string, runDir: string): string {
-  if (text.length <= RESULT_INLINE_BUDGET) return text;
+function formatResult(text: string, runDir: string): { body: string; spillPath?: string } {
+  if (text.length <= RESULT_INLINE_BUDGET) return { body: text };
   try {
-    const filePath = writeResultFile(runDir, text);
-    return (
-      text.slice(0, RESULT_INLINE_BUDGET) +
-      `\n\n... [full result (${text.length} chars) written to: ${filePath} — read it for the complete output]`
-    );
+    const spillPath = writeResultFile(runDir, text);
+    return { body: text.slice(0, RESULT_INLINE_BUDGET), spillPath };
   } catch {
     // Spill failed (disk full / perms): fall back to the lossy cap rather than
     // swallow the result entirely. (Matches the pre-R6 behavior.)
-    return (
-      text.slice(0, RESULT_INLINE_BUDGET) +
-      "\n\n... [truncated — full-result spill failed]"
-    );
+    return { body: text.slice(0, RESULT_INLINE_BUDGET) };
   }
 }
 
@@ -354,22 +348,26 @@ export default function (pi: ExtensionAPI) {
 
     // Agent-def overlay (additive over the mode base; spec §3.3). extensions/
     // skills only ever ADD; tools allowlist-restricts; disallowedTools deny-first;
-    // model overrides. System prompt → temp file + --append-system-prompt.
+    // model overrides. System prompt → prompt.md in the run dir +
+    // --append-system-prompt.
     //
-    // Subagent identity injection: a spawned child is a fresh `pi` process
-    // with no inherent notion it's a subagent — inject a short operational
-    // frame so it knows it's a background agent, who spawned it (user via a
-    // slash command vs the main agent via a tool), and that its output is
-    // returned automatically (work autonomously, don't await user input).
-    // Merged into the one --append-system-prompt file: pi keeps only the
-    // FIRST flag, so agent identity + subagent context + chain position must
-    // all land in a single file here.
+    // Subagent identity (Q10): a spawned child is a fresh `pi` process with no
+    // inherent notion it's a subagent. Reveal the channel's PURPOSE — not a
+    // forcing modal (P4): name what the "??" marker is FOR (asking mid-task at a
+    // risky fork) + the mechanism, so the model retains judgment over WHEN to
+    // yield. Replaces the old "work autonomously, don't await user input" line,
+    // which directly contradicted Q4's cooperation primitive.
+    // Merged into the one --append-system-prompt file: pi keeps only the FIRST
+    // flag, so agent identity + subagent context + chain position must all land
+    // in a single file here.
     const originLabel = state.origin === "user"
       ? "the user (via a slash command)"
       : "the main agent (via a tool call)";
     const subagentContext =
       `[Subagent context]\n` +
-      `You are a subagent — a background agent spawned by ${originLabel} to perform a delegated task. You are not the main agent and do not interact with the user directly. Work autonomously on the task; when finished, your final output is returned to ${originLabel} automatically.`;
+      `You are a subagent — a background agent spawned by ${originLabel} to perform a delegated task. You are not the main agent and do not interact with the user directly. Work toward completing the task; your final output is returned to ${originLabel} automatically when your turn ends.\n\n` +
+      `The "??" marker is for asking ${originLabel} a question mid-task: if you reach a fork where proceeding risks wrong or wasted work, end your turn with "?? " followed by your question. Your turn ends; ${originLabel} continues you with an answer. One question at a time — a new one replaces any pending.\n\n` +
+      `When a continuation arrives after your "??" question, read it before acting: it's either an answer to apply as context and resume, or a redirection. Distinguish before proceeding.`;
     let promptPath: string | null = null;
     if (agentConfig) {
       for (const f of agentConfigFlags(agentConfig)) args.push(f);
@@ -447,33 +445,80 @@ export default function (pi: ExtensionAPI) {
         if (buffer.trim()) processLine(state, buffer);
         clearInterval(timer);
         state.elapsed = Date.now() - startTime;
-        state.status = code === 0 ? "done" : "error";
         state.proc = undefined;
-        updateWidgets();
-        // Result body: a tool-name-only summary (how it got the result) followed
-        // by the assistant's text output. Full per-call args/results live only in
-        // the inspector; nothing detailed leaks into the main conversation.
-        const tools = state.events.filter((e) => e.kind === "tool") as Extract<
-          InspectorEvent,
-          { kind: "tool" }
-        >[];
-        let toolSummary = "";
-        if (tools.length > 0) {
-          const counts: Record<string, number> = {};
-          for (const t of tools)
-            counts[t.toolName] = (counts[t.toolName] ?? 0) + 1;
-          toolSummary = `Tools called (${tools.length}): ${Object.entries(
-            counts,
-          )
-            .map(([n, c]) => `${n} ×${c}`)
-            .join(", ")}\n\n`;
+
+        // Q5: detect a cooperative "??" turn-yield. The subagent ends its turn
+        // with "?? <question>" (the last text event starts with the marker)
+        // when it hits a fork where proceeding risks wrong/wasted work (Q10).
+        const lastTextEvent = [...state.events]
+          .reverse()
+          .find((e) => e.kind === "text") as
+          | Extract<InspectorEvent, { kind: "text" }>
+          | undefined;
+        const lastText = lastTextEvent?.text.trim() ?? "";
+        const yieldMatch =
+          code === 0 ? lastText.match(/^\?\?\s+(.*)$/s) : null;
+        if (yieldMatch) {
+          const question = yieldMatch[1].trim();
+          if (state.chainId !== undefined) {
+            // Q11d: a chain step yielding "??" has no answer route (the
+            // coordinator auto-advances; no main agent in the loop). Detect-and-
+            // fail so the chain NEVER hangs — treat the yield as a step failure.
+            state.status = "error";
+            state.pendingRequest = undefined;
+            updateWidgets();
+            try {
+              ctx.ui.notify(
+                `Subagent #${state.id} yielded "??" in chain — failing step`,
+                "warning",
+              );
+            } catch {}
+            const ch = chains.get(state.chainId);
+            if (ch && ch.status === "running") {
+              failChain(
+                ch,
+                `step ${ch.currentIndex + 1} (${ch.steps[ch.currentIndex]?.agent ?? "?"}) yielded "??" — chains have no answer route; spawn this work standalone if it needs input.`,
+              );
+            }
+            resolve();
+            return;
+          }
+          // Q4: cooperative turn-yield. Flip blocked; the pendingRequest is a
+          // derived pointer the views + the followUp read (Q11). One request
+          // at a time — a fresh yield on a later turn supersedes any prior.
+          state.status = "blocked";
+          state.pendingRequest = { question, askedAt: Date.now() };
+          updateWidgets();
+          try {
+            ctx.ui.notify(
+              `Subagent #${state.id} blocked — asking a question`,
+              "warning",
+            );
+          } catch {}
+          // 7.2-style suppression: don't ping if removed mid-turn.
+          if (agents.has(state.id)) {
+            pi.sendMessage(
+              {
+                customType: "subagent-request",
+                content: `[Subagent #${state.id}] blocked, asking:\n${question}`,
+                display: true,
+              },
+              { deliverAs: "followUp", triggerTurn: true },
+            );
+          }
+          resolve();
+          return;
         }
+
+        // Normal close: done | error. Clear any prior yield state.
+        state.status = code === 0 ? "done" : "error";
+        state.pendingRequest = undefined;
+        updateWidgets();
         const textResult = state.events
           .filter((e) => e.kind === "text")
           .map((e) => (e as Extract<InspectorEvent, { kind: "text" }>).text)
           .join("")
           .trim();
-        const result = toolSummary + (textResult || "(no text output)");
         try {
           ctx.ui.notify(
             `Subagent #${state.id} ${state.status} in ${Math.round(state.elapsed / 1000)}s`,
@@ -489,10 +534,20 @@ export default function (pi: ExtensionAPI) {
           // running — those delete it from the map, so agents.has is false. A
           // naturally-completed sub stays in the map (for /sublist) → fires.
           if (agents.has(state.id)) {
+            // Q7: trimmed result — keep #id, ⚡lite, "(no text output)", spill
+            // pointer; cut the prompt echo, tool summary, turn count, origin
+            // line (origin is file-native in meta.json per Q6).
+            const { body, spillPath } = formatResult(
+              textResult,
+              state.runDir,
+            );
             pi.sendMessage(
               {
                 customType: "subagent-result",
-                content: `${state.origin === "user" ? " (This agent was created by User)\n\n" : ""}Subagent #${state.id}${state.lite ? " (⚡lite)" : ""}${state.turnCount > 1 ? ` (Turn ${state.turnCount})` : ""} finished "${prompt}" in ${Math.round(state.elapsed / 1000)}s.\n\nResult:\n${spillResult(result, state.runDir)}`,
+                content:
+                  `[Subagent #${state.id}${state.lite ? " ⚡lite" : ""}] finished in ${Math.round(state.elapsed / 1000)}s.\n` +
+                  `${body || "(no text output)"}` +
+                  (spillPath ? `\nFull result: ${spillPath}` : ""),
                 display: true,
               },
               { deliverAs: "followUp", triggerTurn: true },
@@ -678,6 +733,7 @@ Modes (via the 'lite' parameter):
       state.status = "running";
       state.task = args.prompt;
       state.events = [];
+      state.pendingRequest = undefined; // Q4: answer flips blocked->running
       state.toolIndex = new Map();
       state.elapsed = 0;
       state.turnCount++;
@@ -1329,7 +1385,12 @@ Modes (via the 'lite' parameter):
       `[Chain context — your role in this run]\n` +
       `You are step ${i + 1} of ${chain.steps.length} in chain "${chain.name}".\n` +
       `Previous agent: ${prevAgent ?? "none — you are the first step"}.\n` +
-      `Next agent: ${nextAgent ?? "none — you are the final step"}.`;
+      `Next agent: ${nextAgent ?? "none — you are the final step"}.\n\n` +
+      // Q11d: chain steps have no answer route (the coordinator auto-advances;
+      // no main agent in the loop). Reveal WHY (not just forbid) so the model
+      // understands — a yield is semantically undefined here, handled by the
+      // detect-and-fail path in the close handler.
+      `This subagent runs as one step in an automated chain; the "??" answer channel has no route in chains, so proceed through the step without yielding "??".`;
     spawnAgent(
       stepState,
       task,
@@ -1391,10 +1452,14 @@ Modes (via the 'lite' parameter):
       })
       .join(", ");
     const lastAgent = chain.steps[chain.steps.length - 1]?.agent ?? "?";
+    const { body: finalBody, spillPath: finalSpill } = formatResult(
+      finalText,
+      lastState?.runDir ?? runDirPath(chain.subagentIds[chain.subagentIds.length - 1] ?? -1),
+    );
     pi.sendMessage(
       {
         customType: "chain-result",
-        content: `Chain C${chain.id} "${chain.name}" complete (${chain.steps.length}/${chain.steps.length} steps).\nFinal result (${lastAgent}):\n${spillResult(finalText, lastState?.runDir ?? runDirPath(chain.subagentIds[chain.subagentIds.length - 1] ?? -1))}\n${perStepWithTools}.${chain.worktree ? `\nWorktree: ${chain.worktree.path} (branch ${chain.worktree.branch}).` : ""}`,
+        content: `Chain C${chain.id} "${chain.name}" complete (${chain.steps.length}/${chain.steps.length} steps).\nFinal result (${lastAgent}):\n${finalBody}${finalSpill ? `\nFull result: ${finalSpill}` : ""}\n${perStepWithTools}.${chain.worktree ? `\nWorktree: ${chain.worktree.path} (branch ${chain.worktree.branch}).` : ""}`,
         display: true,
       },
       { deliverAs: "followUp", triggerTurn: true },
@@ -1838,6 +1903,7 @@ Modes (via the 'lite' parameter):
       state.status = "running";
       state.task = prompt;
       state.events = [];
+      state.pendingRequest = undefined; // Q4: answer flips blocked->running
       state.toolIndex = new Map();
       state.elapsed = 0;
       state.turnCount++;
