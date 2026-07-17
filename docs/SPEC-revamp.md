@@ -442,10 +442,17 @@ non-compliance.**
   `??` despite the prompt (models don't always comply) would flip to `blocked`,
   but `onChainStepClose` waits for a close that a blocked step never produces →
   the chain hangs forever. When a chain-context subagent transitions to
-  `blocked`, treat it as a chain **failure** (`abortChain`, emit a terminal
-  followUp, reap the step). NOT a silent hang. Cost: a chain step that wanted to
-  yield is killed; acceptable because a step that genuinely needs an input must
-  be a standalone subagent the main agent manages, not a pipeline step.
+  `blocked`, treat it as a chain **failure** (`failChain`: emit a terminal
+  `chain-result` followUp, mark the chain errored, stop auto-advancing). NOT a
+  silent hang; NOT a `subagent-request` (no answer route in chains). The failed
+  step's `SubState` + RunDir are deliberately **left for inspection**
+  (`/subinspect #N`) rather than reaped on the spot — consistent with Q9's
+  in-session-zombie philosophy — and are cleaned by `/subrm <id>` or the next
+  `session_start` sweep. Cost: a chain step that wanted to yield is killed;
+  acceptable because a step that genuinely needs an input must be a standalone
+  subagent the main agent manages, not a pipeline step. *(Implementation note:
+  `failChain` over `abortChain` because the yield is a step FAILURE, not a
+  user-initiated halt — matches the existing crash path.)*
 
 ### Q12 — Migration ordering (7 commits, no backwards dependencies)
 
@@ -520,8 +527,9 @@ loadable + testable AND no ordering hazard exists.
   steps can't ask mid-run; if a step needs input, spawn it standalone instead."
   The cost moves from a silent limitation to a stated boundary the LLM/user
   picks around at selection time. The detect-and-fail handler (step 5) still
-  catches non-compliance — a chain step that yields `??` aborts with a failure
-  followUp rather than hanging.
+  catches non-compliance — a chain step that yields `??` fails with a terminal
+  `chain-result` followUp rather than hanging (the failed step is left for
+  inspection; see Q11d).
 - **~~A hung child lingers until the user `/subrm`s.~~** **Dissolved** by
   restoring `subagent_remove` (Q6). The LLM now reaps its own done-with spawns
   (`origin === "agent"` scoped for clear-all). This was the single biggest
