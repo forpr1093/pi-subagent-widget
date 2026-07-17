@@ -20,6 +20,7 @@ A pi extension that spawns background subagents with live stacking widgets.
 | `config.json` | `liteAllowedExt`, `disallowedExt`, `worktree` settings. |
 | `docs/SPEC-orchestration.md` | Locked design spec for orchestration (decisions, schemas, §11 research, §12 worktree). |
 | `docs/SPEC-revamp.md` | Locked revamp spec: lifecycle (RunDir §Q2, process-group kill §Q3, orphan reaper §Q9), cooperation (`??` yield channel §Q4–Q7, identity prompt §Q10, blocked status §Q11, chain detect-and-fail §Q11d), surface (4-tool / 9-command collapse §Q6, `/sub doctor` §Q8). |
+| `docs/AGENT-GUIDE.md` | **For agents researching this extension** — the mental model in one place: architecture, lifecycle state machine, data flow, cooperation model, design philosophy, honest known gaps + future-direction (Missions-like) aspiration. Read this first before the SPEC-*.md decision records. |
 | `docs/REVIEW-revamp.md` | Implementation audit of the revamp spec (SATISFIES/PARTIAL findings, locked-constraint pass sheet). |
 | `README.md` | This file. |
 
