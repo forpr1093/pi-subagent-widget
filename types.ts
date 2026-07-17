@@ -29,12 +29,16 @@ export type SubagentOrigin = "user" | "agent";
 
 export interface SubState {
   id: number;
-  status: "running" | "done" | "error";
+  status: "running" | "done" | "error" | "blocked";
   task: string;
   events: InspectorEvent[]; // single source of truth for the current turn
   toolIndex: Map<string, number>; // toolCallId → events index (in-place patching)
   elapsed: number;
-  sessionFile: string; // persistent JSONL session path — used by /subcont to resume
+  runDir: string; // Q2 — unified run dir (~/.pi/agent/runs/<id>/); holds
+                   // prompt.md / result.txt / session.jsonl / meta.json.
+                   // Reaped as a unit on removal + by the Q9 sweep.
+  sessionFile: string; // persistent JSONL session path (runDir/session.jsonl) —
+                       // used by /subcont to resume
   turnCount: number; // increments each time /subcont continues this agent
   lite: boolean; // whether this agent runs in lite mode (restricted tools, no thinking)
   origin: SubagentOrigin; // who initiated this subagent: "user" (/sub slash) or "agent" (subagent_create tool)
@@ -46,6 +50,11 @@ export interface SubState {
                     // shared tree). Owned here so /subrm + session_start can clean it.
                     // Chain steps carry NO worktree field — the ChainState owns it.
   proc?: any; // active ChildProcess ref (for kill on /subrm)
+  // Q11: set when status flips running->blocked (a "??" yield). Derived
+  // pointer maintained by the status machine so inspector / /sublist / the
+  // subagent-request followUp all read it in O(1) — NOT a re-scan of events.
+  // Cleared on blocked->running (answered) and blocked->done|error (reaped).
+  pendingRequest?: { question: string; askedAt: number };
 }
 
 /** Coordinator record for one running chain (spec §7.1). Thin: does not render
@@ -54,6 +63,7 @@ export interface SubState {
 export interface ChainState {
   id: number; // C1, C2, …
   name: string; // template name, or "inline" for /subchain CLI-compose
+  origin: SubagentOrigin; // who started this chain: "user" (/subchain) or "agent" (orchestrate tool)
   steps: ChainStepDef[]; // resolved references (agent names + tasks)
   input: string; // {input} substitution value
   currentIndex: number; // 0-based; -1 = not started

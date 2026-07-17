@@ -40,7 +40,6 @@ import { getAgentDir, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import type {
   ChainState,
@@ -48,8 +47,19 @@ import type {
   SubState,
   SubagentOrigin,
 } from "./types.ts";
-import { appendText, cap, openInspector, stringifyVal, transcriptText } from "./inspector.ts";
-import { deleteSessionFile, makeSessionFile } from "./session.ts";
+import { appendText, cap, openInspector, stringifyVal } from "./inspector.ts";
+import { makeSessionFile } from "./session.ts";
+import {
+  createRunDir,
+  readMeta,
+  removeRunDir,
+  runDirPath,
+  RUNS_DIR,
+  setRunPid,
+  writePromptFile,
+  writeResultFile,
+  type RunMeta,
+} from "./rundir.ts";
 import { loadDisallowedExtensions, loadLiteExtensions, loadWorktreeMode, NEURALWATT_PROVIDER } from "./config.ts";
 import { effectiveDisallowedExtensions, normalizeForMatch, resolveFullModeExtArgs } from "./disallow.ts";
 import { buildChainWidget, buildSubagentWidget } from "./widget.ts";
@@ -71,56 +81,39 @@ import {
   type Worktree,
 } from "./worktree.ts";
 
-/** Write an agent-def system prompt body to a temp file (spec §3.3). pi's
- *  --append-system-prompt reads the file (resolvePromptInput treats an existing
- *  path as a file). Caller cleans up via cleanupAgentPromptFile. */
-function writeAgentPromptFile(
-  agentName: string,
-  body: string,
-): { dir: string; path: string } {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
-  const safeName = agentName.replace(/[^\w.-]+/g, "_");
-  const filePath = path.join(dir, `prompt-${safeName}.md`);
-  fs.writeFileSync(filePath, body, { encoding: "utf-8", mode: 0o600 });
-  return { dir, path: filePath };
-}
-
-/** Best-effort cleanup of the temp prompt file + its dir. Swallows ENOENT. */
-function cleanupAgentPromptFile(p: { dir: string; path: string } | null) {
-  if (!p) return;
-  try {
-    fs.unlinkSync(p.path);
-  } catch {}
-  try {
-    fs.rmdirSync(p.dir);
-  } catch {}
-}
-
-/** R6: deliver full subagent/chain results without lossy truncation. If the
- *  text fits the inline budget (8000 chars), return it verbatim. Otherwise spill
- *  the FULL text to a temp file (mode 0o600) and return an 8000-char prefix + a
- *  pointer — so the orchestrator can `read` the rest on demand instead of
- *  working with a truncated tail (this is what bit the reviewer subagents).
- *  Matches pi's own spill-to-temp-file pattern for large responses. */
+/** R6/Q7: deliver full subagent/chain results without lossy truncation.
+ *  If the text fits the inline budget (8000 chars), return it verbatim. Otherwise
+ *  spill the FULL text to result.txt INSIDE the run dir (Q2 — was orphaned in
+ *  $TMPDIR, now reaped with the run) and return an 8000-char prefix + the
+ *  spill path, so the orchestrator can `read` the rest on demand instead of
+ *  working with a truncated tail. Returns { body, spillPath? }. */
 const RESULT_INLINE_BUDGET = 8000;
-function spillResult(text: string): string {
-  if (text.length <= RESULT_INLINE_BUDGET) return text;
+function formatResult(text: string, runDir: string): { body: string; spillPath?: string } {
+  if (text.length <= RESULT_INLINE_BUDGET) return { body: text };
   try {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-result-"));
-    const filePath = path.join(dir, "result.txt");
-    fs.writeFileSync(filePath, text, { encoding: "utf-8", mode: 0o600 });
-    return (
-      text.slice(0, RESULT_INLINE_BUDGET) +
-      `\n\n... [full result (${text.length} chars) written to: ${filePath} — read it for the complete output]`
-    );
+    const spillPath = writeResultFile(runDir, text);
+    return { body: text.slice(0, RESULT_INLINE_BUDGET), spillPath };
   } catch {
     // Spill failed (disk full / perms): fall back to the lossy cap rather than
     // swallow the result entirely. (Matches the pre-R6 behavior.)
-    return (
-      text.slice(0, RESULT_INLINE_BUDGET) +
-      "\n\n... [truncated — full-result spill failed]"
-    );
+    return { body: text.slice(0, RESULT_INLINE_BUDGET) };
   }
+}
+
+/** Echo the user's original task/input into a follow-up header so the main
+ *  agent knows WHAT the user asked (it has no other way to know for a
+ *  user-spawned subagent/chain — agent-origin keeps the bare header since the
+ *  agent already knows the task it assigned). Q7 trimmed the prompt echo for
+ *  general brevity; this re-adds it narrowly for user-origin only. Returns ""
+ *  when `task` is empty (e.g. an inline chain with no {input}). */
+const USER_TASK_CAP = 300;
+function echoUserTask(label: string, task: string): string {
+  const t = task.trim().replace(/\s+/g, " ");
+  if (!t) return "";
+  const truncated = t.length > USER_TASK_CAP
+    ? t.slice(0, USER_TASK_CAP) + "… (full task in prompt.md)"
+    : t;
+  return `\n${label}: ${truncated}`;
 }
 
 /** Parse a target ID shared by the remove/inspect tools + slash commands (spec
@@ -148,6 +141,81 @@ function parseTargetId(raw: string | number): TargetId {
   const sm = s.match(/^#?(\d+)$/);
   if (sm) return { kind: "subagent", id: parseInt(sm[1], 10) };
   return { kind: "invalid", reason: `"${raw}" is not a #N or CN id` };
+}
+
+/** Q3: kill a subagent's whole process group (graceful SIGTERM -> forced SIGKILL
+ *  after ~5s). The child was spawned detached:true so it (and every process it
+ *  spawned) share one process group rooted at its pid; a negative pid kills the
+ *  entire group at once, so grandchildren (git, npm, dev servers) die with the
+ *  worker instead of orphaning (holding file locks + worktrees). Mirrors pi's
+ *  own exec.js graceful->forced. On Windows (no setsid) falls back to a direct
+ *  pid kill. Best-effort: a kill failure must never crash the extension. */
+function killProcessGroupByPid(pid: number) {
+  const win32 = process.platform === "win32";
+  const killOne = (sig: NodeJS.Signals) => {
+    try { process.kill(pid, sig); } catch {}
+  };
+  const killGroup = (sig: NodeJS.Signals) => {
+    if (win32) { killOne(sig); return; }
+    try {
+      process.kill(-pid, sig);
+    } catch {
+      // ESRCH = group already gone (normal if it closed); fall back to direct.
+      killOne(sig);
+    }
+  };
+  killGroup("SIGTERM");
+  const guard = setTimeout(() => {
+    if (win32) killOne("SIGKILL");
+    else { try { process.kill(-pid, "SIGKILL"); } catch {} }
+  }, 5000);
+  guard.unref?.();
+}
+
+function terminateProcessGroup(proc: any) {
+  if (!proc || proc.pid === undefined) return;
+  killProcessGroupByPid(proc.pid);
+}
+
+/** Is a pid still alive? (process.kill with signal 0 probes liveness.) */
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Q9: sweep stale RunDirs whose spawning pi (meta.parentPid) is no longer
+ *  alive. Single reap condition (no age / no status checks — every run the
+ *  sweep should NOT touch is already excluded by "parentPid alive"). Reap =
+ *  process-group kill the orphaned worker if its pid is known + alive, then
+ *  rm -rf the run dir. Returns the reaped run ids (for /sub doctor reporting).
+ *  In-session zombies (worker exited, parent still alive) are intentionally
+ *  NOT reaped here — those are a /sub doctor diagnostic, not a sweep rule. */
+function sweepRuns(): string[] {
+  const reaped: string[] = [];
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(RUNS_DIR);
+  } catch {
+    return reaped; // no runs dir yet — nothing to sweep
+  }
+  for (const name of entries) {
+    if (!/^\d+$/.test(name)) continue; // only numeric run ids (this session's)
+    const dir = path.join(RUNS_DIR, name);
+    const meta = readMeta(dir);
+    if (!meta) continue; // corrupt/incomplete — leave for /sub doctor
+    if (isPidAlive(meta.parentPid)) continue; // parent alive -> not reapable
+    // Orphan: parent pi is gone. Kill the live worker process-group (a
+    // detached worker may still be running — esp. a blocked one idle between
+    // turns), then remove the run dir.
+    if (meta.pid && isPidAlive(meta.pid)) killProcessGroupByPid(meta.pid);
+    removeRunDir(dir);
+    reaped.push(name);
+  }
+  return reaped;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -296,23 +364,27 @@ export default function (pi: ExtensionAPI) {
 
     // Agent-def overlay (additive over the mode base; spec §3.3). extensions/
     // skills only ever ADD; tools allowlist-restricts; disallowedTools deny-first;
-    // model overrides. System prompt → temp file + --append-system-prompt.
+    // model overrides. System prompt → prompt.md in the run dir +
+    // --append-system-prompt.
     //
-    // Subagent identity injection: a spawned child is a fresh `pi` process
-    // with no inherent notion it's a subagent — inject a short operational
-    // frame so it knows it's a background agent, who spawned it (user via a
-    // slash command vs the main agent via a tool), and that its output is
-    // returned automatically (work autonomously, don't await user input).
-    // Merged into the one --append-system-prompt file: pi keeps only the
-    // FIRST flag, so agent identity + subagent context + chain position must
-    // all land in a single file here.
+    // Subagent identity (Q10): a spawned child is a fresh `pi` process with no
+    // inherent notion it's a subagent. Reveal the channel's PURPOSE — not a
+    // forcing modal (P4): name what the "??" marker is FOR (asking mid-task at a
+    // risky fork) + the mechanism, so the model retains judgment over WHEN to
+    // yield. Replaces the old "work autonomously, don't await user input" line,
+    // which directly contradicted Q4's cooperation primitive.
+    // Merged into the one --append-system-prompt file: pi keeps only the FIRST
+    // flag, so agent identity + subagent context + chain position must all land
+    // in a single file here.
     const originLabel = state.origin === "user"
       ? "the user (via a slash command)"
       : "the main agent (via a tool call)";
     const subagentContext =
       `[Subagent context]\n` +
-      `You are a subagent — a background agent spawned by ${originLabel} to perform a delegated task. You are not the main agent and do not interact with the user directly. Work autonomously on the task; when finished, your final output is returned to ${originLabel} automatically.`;
-    let promptTmp: { dir: string; path: string } | null = null;
+      `You are a subagent — a background agent spawned by ${originLabel} to perform a delegated task. You are not the main agent and do not interact with the user directly. Work toward completing the task; your final output is returned to ${originLabel} automatically when your turn ends.\n\n` +
+      `The "??" marker is for asking ${originLabel} a question mid-task: if you reach a fork where proceeding risks wrong or wasted work, end your turn with "?? " followed by your question. Your turn ends; ${originLabel} continues you with an answer. One question at a time — a new one replaces any pending.\n\n` +
+      `When a continuation arrives after your "??" question, read it before acting: it's either an answer to apply as context and resume, or a redirection. Distinguish before proceeding.`;
+    let promptPath: string | null = null;
     if (agentConfig) {
       for (const f of agentConfigFlags(agentConfig)) args.push(f);
     }
@@ -323,9 +395,11 @@ export default function (pi: ExtensionAPI) {
     bodyParts.push(subagentContext);
     if (chainContext?.trim()) bodyParts.push(chainContext.trim());
     const body = bodyParts.join("\n\n");
+    // Q2: the --append-system-prompt body lives as prompt.md inside the run dir
+    // (was a mkdtemp temp file that leaked on crash). Reaped with the run.
     if (body.trim()) {
-      promptTmp = writeAgentPromptFile(agentConfig?.name ?? "subagent", body);
-      args.push("--append-system-prompt", promptTmp.path);
+      promptPath = writePromptFile(state.runDir, body);
+      args.push("--append-system-prompt", promptPath);
     }
 
     // B2/R2: the prompt is the final positional arg. pi's argv parser eats a
@@ -343,13 +417,25 @@ export default function (pi: ExtensionAPI) {
     args.push(safePrompt);
 
     return new Promise((resolve) => {
+      // Q3: detached:true → child calls setsid() and becomes a process-group
+      // leader (every process it spawns joins that group). Lets us kill the
+      // WHOLE tree via process.kill(-pid) instead of orphaning grandchildren
+      // (git, npm, tsx, dev servers) that hold file locks + worktrees. Skipped
+      // on Windows (no setsid; process.kill(-pid) semantics differ) — falls
+      // back to the direct SIGTERM there. We do NOT unref(): we still read
+      // stdout + await close in this process.
       const proc = spawn("pi", args, {
         cwd: childCwd,
         stdio: ["ignore", "pipe", "pipe"],
         env: { ...process.env },
         shell: process.platform === "win32",
+        detached: process.platform !== "win32",
       });
       state.proc = proc;
+      // Q9: persist the worker pid into meta.json so the reaper can process-
+      // group-kill an orphaned worker whose parent pi died (meta was written
+      // before the child existed; patch it now that pid is known).
+      setRunPid(state.runDir, proc.pid!);
       const startTime = Date.now();
       const timer = setInterval(() => {
         state.elapsed = Date.now() - startTime;
@@ -375,33 +461,83 @@ export default function (pi: ExtensionAPI) {
         if (buffer.trim()) processLine(state, buffer);
         clearInterval(timer);
         state.elapsed = Date.now() - startTime;
-        state.status = code === 0 ? "done" : "error";
         state.proc = undefined;
-        updateWidgets();
-        // Result body: a tool-name-only summary (how it got the result) followed
-        // by the assistant's text output. Full per-call args/results live only in
-        // the inspector; nothing detailed leaks into the main conversation.
-        const tools = state.events.filter((e) => e.kind === "tool") as Extract<
-          InspectorEvent,
-          { kind: "tool" }
-        >[];
-        let toolSummary = "";
-        if (tools.length > 0) {
-          const counts: Record<string, number> = {};
-          for (const t of tools)
-            counts[t.toolName] = (counts[t.toolName] ?? 0) + 1;
-          toolSummary = `Tools called (${tools.length}): ${Object.entries(
-            counts,
-          )
-            .map(([n, c]) => `${n} ×${c}`)
-            .join(", ")}\n\n`;
+
+        // Q5: detect a cooperative "??" turn-yield. The subagent ends its turn
+        // with "?? <question>" (the last text event starts with the marker)
+        // when it hits a fork where proceeding risks wrong/wasted work (Q10).
+        const lastTextEvent = [...state.events]
+          .reverse()
+          .find((e) => e.kind === "text") as
+          | Extract<InspectorEvent, { kind: "text" }>
+          | undefined;
+        const lastText = lastTextEvent?.text.trim() ?? "";
+        const yieldMatch =
+          code === 0 ? lastText.match(/^\?\?\s+(.*)$/s) : null;
+        if (yieldMatch) {
+          const question = yieldMatch[1].trim();
+          if (state.chainId !== undefined) {
+            // Q11d: a chain step yielding "??" has no answer route (the
+            // coordinator auto-advances; no main agent in the loop). Detect-and-
+            // fail so the chain NEVER hangs — treat the yield as a step failure.
+            state.status = "error";
+            state.pendingRequest = undefined;
+            updateWidgets();
+            try {
+              ctx.ui.notify(
+                `Subagent #${state.id} yielded "??" in chain — failing step`,
+                "warning",
+              );
+            } catch {}
+            const ch = chains.get(state.chainId);
+            if (ch && ch.status === "running") {
+              failChain(
+                ch,
+                `step ${ch.currentIndex + 1} (${ch.steps[ch.currentIndex]?.agent ?? "?"}) yielded "??" — chains have no answer route; spawn this work standalone if it needs input.`,
+              );
+            }
+            resolve();
+            return;
+          }
+          // Q4: cooperative turn-yield. Flip blocked; the pendingRequest is a
+          // derived pointer the views + the followUp read (Q11). One request
+          // at a time — a fresh yield on a later turn supersedes any prior.
+          state.status = "blocked";
+          state.pendingRequest = { question, askedAt: Date.now() };
+          updateWidgets();
+          try {
+            ctx.ui.notify(
+              `Subagent #${state.id} blocked — asking a question`,
+              "warning",
+            );
+          } catch {}
+          // 7.2-style suppression: don't ping if removed mid-turn.
+          if (agents.has(state.id)) {
+            pi.sendMessage(
+              {
+                customType: "subagent-request",
+                content:
+                  `[Subagent #${state.id}${state.origin === "user" ? " · user-spawned" : ""}] blocked, asking:` +
+                  (state.origin === "user" ? echoUserTask("Task", state.task) : "") +
+                  `\n${question}`,
+                display: true,
+              },
+              { deliverAs: "followUp", triggerTurn: true },
+            );
+          }
+          resolve();
+          return;
         }
+
+        // Normal close: done | error. Clear any prior yield state.
+        state.status = code === 0 ? "done" : "error";
+        state.pendingRequest = undefined;
+        updateWidgets();
         const textResult = state.events
           .filter((e) => e.kind === "text")
           .map((e) => (e as Extract<InspectorEvent, { kind: "text" }>).text)
           .join("")
           .trim();
-        const result = toolSummary + (textResult || "(no text output)");
         try {
           ctx.ui.notify(
             `Subagent #${state.id} ${state.status} in ${Math.round(state.elapsed / 1000)}s`,
@@ -417,10 +553,21 @@ export default function (pi: ExtensionAPI) {
           // running — those delete it from the map, so agents.has is false. A
           // naturally-completed sub stays in the map (for /sublist) → fires.
           if (agents.has(state.id)) {
+            // Q7: trimmed result — keep #id, ⚡lite, "(no text output)", spill
+            // pointer; cut the prompt echo, tool summary, turn count, origin
+            // line (origin is file-native in meta.json per Q6).
+            const { body, spillPath } = formatResult(
+              textResult,
+              state.runDir,
+            );
             pi.sendMessage(
               {
                 customType: "subagent-result",
-                content: `${state.origin === "user" ? " (This agent was created by User)\n\n" : ""}Subagent #${state.id}${state.lite ? " (⚡lite)" : ""}${state.turnCount > 1 ? ` (Turn ${state.turnCount})` : ""} finished "${prompt}" in ${Math.round(state.elapsed / 1000)}s.\n\nResult:\n${spillResult(result)}`,
+                content:
+                  `[Subagent #${state.id}${state.lite ? " ⚡lite" : ""}${state.origin === "user" ? " · user-spawned" : ""}] finished in ${Math.round(state.elapsed / 1000)}s.` +
+                  (state.origin === "user" ? echoUserTask("Task", state.task) : "") +
+                  `\n${body || "(no text output)"}` +
+                  (spillPath ? `\nFull result: ${spillPath}` : ""),
                 display: true,
               },
               { deliverAs: "followUp", triggerTurn: true },
@@ -431,7 +578,8 @@ export default function (pi: ExtensionAPI) {
           // aggregate (complete/failed/aborted) followUp + auto-advances (spec §7.3).
           onChainStepClose(state, ctx);
         }
-        cleanupAgentPromptFile(promptTmp);
+        // Q2: prompt.md lives inside state.runDir — reaped with the run, no
+        // separate temp cleanup needed.
         resolve();
       });
       proc.on("error", (err) => {
@@ -440,7 +588,6 @@ export default function (pi: ExtensionAPI) {
         state.proc = undefined;
         appendText(state, `Error: ${err.message}`);
         updateWidgets();
-        cleanupAgentPromptFile(promptTmp);
         resolve();
       });
     });
@@ -449,13 +596,11 @@ export default function (pi: ExtensionAPI) {
   // ── Tools for the Main Agent ──────────────────────────────────────────────
   pi.registerTool({
     name: "subagent_create",
-    description: `Spawn a background subagent to perform a task without disrupting the main conversation & process. Returns the subagent ID immediately while it runs in the background; the subagent pings back with its result as a follow-up message when it finishes, so you can continue other work or stop your turn in the meantime.
+    description: `Spawn a background subagent to perform a task without disrupting the main conversation & process. Use this when you have substantial independent work to offload. Returns the subagent ID immediately; the subagent pings back with its result as a follow-up message when it finishes, so you can continue other work or stop your turn in the meantime.
 
-Optional \`agent\` (named agent from the \`subagent_catalog\` tool, e.g. "scout"): run the subagent under that agent's role — its system prompt, tools, skills, model, and extensions are applied over the base mode. Use this for single-task agent-driven work without the overhead of the \`orchestrate\` multi-step chain tool. Not supported with lite=true (an agent's extensions would bypass lite's --no-extensions sandbox); combine \`agent\` with \`lite: false\` instead.
+Optional \`agent\` runs the subagent under a named agent's role (its system prompt, tools, skills, model, extensions). Reuse one from \`~/.pi/agent/agents/\` (markdown files). Living subagents + their run artifacts (prompt, result, session, meta) are on disk at \`~/.pi/agent/runs/<id>/\` — \`ls\` it to see what's running, \`read\` its files to inspect one. For multi-step pipelines use the \`orchestrate\` tool instead.
 
-Modes (via the 'lite' parameter):
-- lite=false (default): full subagent. Extensions enabled, unrestricted tools, default thinking level, default model. Use for complex tasks that benefit from extensions and reasoning.
-- lite=true: lite subagent. Only the extensions listed in config.json (sibling of this file) load; restricted tools (read,bash,grep,find,ls), thinking off. Faster and cheaper — use for simple, well-scoped tasks that need only those tools. If the task needs any other tool (e.g. web fetch/search, browser, context7), use lite=false instead. To discover defined agents/templates use the \`subagent_catalog\` tool; to orchestrate multi-step agent workflows use the \`orchestrate\` tool.`,
+\`lite: true\` runs a restricted subagent (no extensions, only read/bash/grep/find/ls, thinking off) — faster and cheaper for simple, well-scoped tasks. A lite subagent physically cannot run extensions or web lookups, so a claim like "I checked the docs" carries a stronger guarantee than a full agent's. Not supported with \`agent\` (an agent's extensions would bypass lite's sandbox); use \`lite: false\` with a named agent.`,
     parameters: Type.Object({
       task: Type.String({
         description:
@@ -464,7 +609,7 @@ Modes (via the 'lite' parameter):
       agent: Type.Optional(
         Type.String({
           description:
-            'Optional: name of a defined agent (from subagent_catalog, e.g. "scout") whose role to run under — applies its system prompt, tools, skills, model, and extensions over the base mode. Not supported with lite=true. Omit for a bare subagent (no role overlay).',
+            'Optional: name of a defined agent (a file under ~/.pi/agent/agents/*.md, e.g. "scout") whose role to run under — applies its system prompt, tools, skills, model, and extensions over the base mode. Not supported with lite=true. Omit for a bare subagent (no role overlay).',
         }),
       ),
       lite: Type.Boolean({
@@ -502,7 +647,7 @@ Modes (via the 'lite' parameter):
             content: [
               {
                 type: "text",
-                text: `Error: no named agent "${args.agent}". Call subagent_catalog to list available agents.`,
+                text: `Error: no named agent "${args.agent}" in ~/.pi/agent/agents/. \`ls ~/.pi/agent/agents/\` to list available agents.`,
               },
             ],
           };
@@ -511,6 +656,14 @@ Modes (via the 'lite' parameter):
       }
       const id = nextId++;
       const wt = maybeCreateWorktree(ctx, "pi-sub", id);
+      const runDir = createRunDir(id, {
+        id,
+        origin: "agent",
+        agent: agentConfig?.name,
+        lite,
+        spawnTime: Date.now(),
+        parentPid: process.pid,
+      });
       const state: SubState = {
         id,
         status: "running",
@@ -518,7 +671,8 @@ Modes (via the 'lite' parameter):
         events: [],
         toolIndex: new Map(),
         elapsed: 0,
-        sessionFile: makeSessionFile(id),
+        runDir,
+        sessionFile: makeSessionFile(runDir),
         turnCount: 1,
         lite,
         origin: "agent",
@@ -542,7 +696,7 @@ Modes (via the 'lite' parameter):
   pi.registerTool({
     name: "subagent_continue",
     description:
-      "Continue an existing subagent's conversation. Use this to give further instructions to a finished subagent. Returns immediately while it runs in the background; the subagent pings back with its result as a follow-up message when it finishes, so you can continue other work or stop your turn in the meantime. The subagent's original lite/full mode is preserved on continuation.\n P.S. User is able to create a subagent in background too.",
+      "Continue an existing subagent's conversation — give further instructions to a finished subagent, or answer a subagent that blocked on a \"??\" question (its followUp said \"blocked, asking:\"). Use this to cooperate with a subagent that asked you something mid-task. Returns immediately while it runs in the background; the subagent pings back with its result as a follow-up message when it finishes. The subagent's original lite/full mode is preserved.\n P.S. User is able to create a subagent in background too. Run artifacts for any subagent live at ~/.pi/agent/runs/<id>/ — `read` its result.txt / session.jsonl / meta.json to inspect one.",
     parameters: Type.Object({
       id: Type.Number({ description: "The ID of the subagent to continue" }),
       prompt: Type.String({
@@ -597,6 +751,7 @@ Modes (via the 'lite' parameter):
       state.status = "running";
       state.task = args.prompt;
       state.events = [];
+      state.pendingRequest = undefined; // Q4: answer flips blocked->running
       state.toolIndex = new Map();
       state.elapsed = 0;
       state.turnCount++;
@@ -620,17 +775,39 @@ Modes (via the 'lite' parameter):
   pi.registerTool({
     name: "subagent_remove",
     description:
-      "Remove a subagent (`#N` or bare `N`) or a whole chain (`CN`). Kills the running step if active. `CN` removes the entire chain (one aborted summary). `#N` belonging to a still-running chain is guarded — remove the whole chain via its `C` id instead.",
+      "Stop and clean up a subagent you no longer need (running, blocked, done, or error) — kills it if active and removes its run dir (~/.pi/agent/runs/<id>/). Pass `id` (#N or N, or a chain CN) to remove one; omit `id` to clear all of YOUR OWN spawned subagents (origin 'agent') only — never the user's. The user's /subclear clears everything regardless.",
     parameters: Type.Object({
-      id: Type.Union(
-        [Type.Number(), Type.String()],
-        {
-          description: "Target id: a subagent `#N` (or bare `N`), or a chain `CN`.",
-        },
+      id: Type.Optional(
+        Type.Union(
+          [Type.Number(), Type.String()],
+          {
+            description: "Target id: a subagent `#N` (or bare `N`), or a chain `CN`. Omit to clear all of your own (origin 'agent') subagents.",
+          },
+        ),
       ),
     }),
     execute: async (callId, args, _signal, _onUpdate, ctx) => {
       widgetCtx = ctx;
+      // Q6: no id -> clear-all scoped to origin 'agent' (the LLM's own spawns;
+      // never user-spawned). Skips chain-step SubStates (remove those via CN).
+      if (args.id === undefined) {
+        let reaped = 0;
+        for (const [sid, s] of Array.from(agents.entries())) {
+          if (s.origin !== "agent" || s.chainId !== undefined) continue;
+          if (s.proc && s.status === "running") terminateProcessGroup(s.proc);
+          ctx.ui.setWidget(`sub-${sid}`, undefined);
+          removeRunDir(s.runDir);
+          cleanupWorktree(s.worktree, true);
+          agents.delete(sid);
+          reaped++;
+        }
+        updateWidgets();
+        return {
+          content: [
+            { type: "text", text: reaped === 0 ? "No subagents of yours to remove." : `Removed ${reaped} of your subagent${reaped !== 1 ? "s" : ""}.` },
+          ],
+        };
+      }
       const res = removeTarget(ctx, args.id);
       return {
         content: [
@@ -640,255 +817,11 @@ Modes (via the 'lite' parameter):
     },
   });
 
-  pi.registerTool({
-    name: "subagent_list",
-    description:
-      "List all active and finished subagents (IDs, tasks, mode, status) and running chains (C-id, step progress).",
-    parameters: Type.Object({}),
-    execute: async (_callId, _args, _signal, _onUpdate, ctx) => {
-      return { content: [{ type: "text", text: buildList(ctx) }] };
-    },
-  });
-
-  pi.registerTool({
-    name: "subagent_inspect",
-    description:
-      "Return a plain-text transcript of a subagent's run (the prompt it received + the assistant text + tool calls with args/results) so the agent can review how a subagent got its result. `#N` (or bare `N`) for one subagent; `CN` for all steps of a chain concatenated; `CN@step` for one step. The /subinspect COMMAND opens the live TUI panel for the user instead; this tool is text-only and works in any mode.",
-    parameters: Type.Object({
-      id: Type.Union(
-        [Type.Number(), Type.String()],
-        {
-          description: "Target id: a subagent `#N` (or bare `N`), a chain `CN`, or a step `CN@step`.",
-        },
-      ),
-    }),
-    execute: async (_callId, args, _signal, _onUpdate, ctx) => {
-      widgetCtx = ctx;
-      const target = parseTargetId(args.id);
-      if (target.kind === "invalid") {
-        return { content: [{ type: "text", text: `Error: ${target.reason}` }] };
-      }
-      if (target.kind === "chain") {
-        const chain = chains.get(target.chainId);
-        if (!chain) {
-          return { content: [{ type: "text", text: `Error: No chain C${target.chainId} found.` }] };
-        }
-        // CN@step → one step's transcript; CN → all steps concatenated.
-        if (target.step !== undefined) {
-          const sid = chain.subagentIds[target.step - 1];
-          const st = sid !== undefined ? agents.get(sid) : undefined;
-          if (!st) {
-            return { content: [{ type: "text", text: `Error: Step C${target.chainId}@${target.step} has no subagent record.` }] };
-          }
-          return { content: [{ type: "text", text: transcriptText(st) }] };
-        }
-        if (chain.steps.length === 0 || chain.subagentIds.length === 0) {
-          return { content: [{ type: "text", text: `Chain C${chain.id} has no spawned steps.` }] };
-        }
-        const parts: string[] = [
-          `chain C${chain.id} "${chain.name}" [${chain.status}] · ${chain.subagentIds.length}/${chain.steps.length} steps${chain.aborted ? " · aborted" : ""}`,
-          "",
-        ];
-        for (let i = 0; i < chain.subagentIds.length; i++) {
-          const sid = chain.subagentIds[i];
-          const st = agents.get(sid);
-          parts.push(`━━━ step ${i + 1}/${chain.steps.length}: ${chain.steps[i].agent} (#${sid}) ━━━`);
-          parts.push(st ? transcriptText(st) : "(no subagent record)");
-          parts.push("");
-        }
-        return { content: [{ type: "text", text: parts.join("\n") }] };
-      }
-      const id = target.id;
-      const state = agents.get(id);
-      if (!state) {
-        return { content: [{ type: "text", text: `Error: No subagent #${id} found.` }] };
-      }
-      return { content: [{ type: "text", text: transcriptText(state) }] };
-    },
-  });
-
-  // ── subagent_catalog (orchestration discovery, spec §5.3) ───────────
-  pi.registerTool({
-    name: "subagent_catalog",
-    description:
-      "Discover named agents (~/.pi/agent/agents/*.md) AND chain templates (~/.pi/agent/chains/*.yaml). Returns each agent's name + one-line description, and each chain's name + description + agent sequence. Read fresh on every call (edits take effect immediately). Call this before orchestrating multi-agent workflows so you know which named agents and chains exist. Does NOT return system prompts, tools, or step task text.",
-    parameters: Type.Object({
-      scope: Type.Optional(
-        Type.Union(
-          [Type.Literal("user"), Type.Literal("project"), Type.Literal("both")],
-          {
-            description:
-              'Which directories to search (agents + chains). "user" = ~/.pi/agent/ only (default). "project" = nearest .pi/ only. "both" = user + project (project overrides same-name).',
-          },
-        ),
-      ),
-    }),
-    execute: async (_callId, args, _signal, _onUpdate, ctx) => {
-      const requested = (args.scope ?? "user") as "user" | "project" | "both";
-      // R5 (8.2/6.4): gate project scope before discovery — listing ≠ running,
-      // but project agent/chain names+descriptions are repo-controlled metadata
-      // that shouldn't surface to the model without the user's trust confirm.
-      // Gate is repo-scoped (covers both agents + chains in one prompt); non-TUI
-      // programmatic calls collapse to "user" (deny by default).
-      const scope = await gateProjectScope(ctx, requested);
-      const { agents } = discoverAgents(ctx.cwd, scope);
-      const { chains } = discoverChains(ctx.cwd, scope);
-      const sections: string[] = [];
-      if (agents.length > 0) {
-        sections.push(
-          `## Agents (${scope})\n${agents
-            .map((a) => `- ${a.name} (${a.source}): ${a.description}`)
-            .join("\n")}`,
-        );
-      }
-      if (chains.length > 0) {
-        sections.push(
-          `## Chains (${scope})\n${chains
-            .map(
-              (c) =>
-                `- ${c.name} (${c.source}): ${c.description} [${c.steps
-                  .map((s) => s.agent)
-                  .join(" → ")}]`,
-            )
-            .join("\n")}`,
-        );
-      }
-      if (sections.length === 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `No agents or chains found (scope: ${scope}). Define agents as markdown files under ~/.pi/agent/agents/ (frontmatter: name + description required; optional: tools, disallowedTools, model, extensions, skills; body = system prompt), and chains as YAML under ~/.pi/agent/chains/ (frontmatter: name + description + steps:[{agent,task}]).`,
-            },
-          ],
-        };
-      }
-      return {
-        content: [{ type: "text", text: sections.join("\n\n") }],
-      };
-    },
-  });
-
-  // ── subagent_build (agent authoring, spec §5.4) ─────────────────────
-  // Build (or overwrite) a named agent file at ~/.pi/agent/agents/<name>.md.
-  // Lets the orchestrating model scaffold a reusable agent when the user asks,
-  // instead of hand-writing the file via raw `write`. Writing a file is inert
-  // until a trusted user run EXECUTES it — so this needs no trust gate (project
-  // execution gates already cover the threat; building ≠ spawning, so there's
-  // no recursion vector either — and subagent-widget is excluded from children
-  // by DEFAULT_DISALLOWED_EXT, so a subagent can't reach this tool anyway).
-  // Self-verifies: re-discovers the written file + confirms the round-trip.
-  pi.registerTool({
-    name: "subagent_build",
-    description:
-      "Write (or overwrite with force) a named agent definition to ~/.pi/agent/agents/<name>.md so it becomes discoverable via subagent_catalog and spawnable via /sub <name> or as a chain step. Use this when the user asks to build/create/make a new agent. Validated: name must match ^[a-z0-9][a-z0-9-]*$ (lowercase, hyphens, alphanumerics). Required: name, description, systemPrompt (the body — the agent's role/prompt). Optional overlay fields: tools (allowlist), disallowedTools (denylist), model, extensions (additive -e), skills (additive --skill), worktree (force git isolation). After writing, verifies the file parses + is discoverable.",
-    parameters: Type.Object({
-      name: Type.String({
-        description: "Agent name. Must match ^[a-z0-9][a-z0-9-]*$ (lowercase, hyphens, alphanumerics; e.g. 'scout', 'api-reviewer'). Becomes the filename `<name>.md`.",
-      }),
-      description: Type.String({
-        description: "One-line description shown in subagent_catalog + /subchain picker. Keep it short + specific.",
-      }),
-      systemPrompt: Type.String({
-        description: "The agent's system prompt (body of the .md file). Define the role, mindset, constraints. Multi-line is fine.",
-      }),
-      tools: Type.Optional(
-        Type.Array(Type.String(), {
-          description: "Optional tool allowlist → --tools (e.g. ['read','grep','ls']). When omitted, the mode's default toolset applies.",
-        }),
-      ),
-      disallowedTools: Type.Optional(
-        Type.Array(Type.String(), {
-          description: "Optional tool denylist → --exclude-tools (applied after `tools` allowlist).",
-        }),
-      ),
-      model: Type.Optional(
-        Type.String({
-          description: "Optional model override (supports provider/id:thinking form, e.g. 'neuralwatt/glm-5.2-short').",
-        }),
-      ),
-      extensions: Type.Optional(
-        Type.Array(Type.String(), {
-          description: "Optional additive extensions → -e (e.g. ['npm:pi-neuralwatt-provider']). Never drops the neuralwatt provider; can't re-load subagent-widget (recursion guard).",
-        }),
-      ),
-      skills: Type.Optional(
-        Type.Array(Type.String(), {
-          description: "Optional additive skills → --skill (paths or names).",
-        }),
-      ),
-      worktree: Type.Optional(
-        Type.Boolean({
-          description: "If true, force git-worktree isolation for this agent even when config worktree is 'off'. Applies to chain steps (standalone spawns are anonymous).",
-        }),
-      ),
-      force: Type.Optional(
-        Type.Boolean({
-          description: "Overwrite if an agent with this name already exists. Default false (refuse + report the existing agent's description).",
-        }),
-      ),
-    }),
-    execute: async (_callId, args, _signal, _onUpdate, ctx) => {
-      const name = (args.name ?? "").trim();
-      const description = (args.description ?? "").trim();
-      const systemPrompt = args.systemPrompt ?? "";
-      if (!/^[a-z0-9][a-z0-9-]*$/.test(name)) {
-        return { content: [{ type: "text", text: `Error: name "${name || "(empty)"}" is invalid. Must match ^[a-z0-9][a-z0-9-]*$ (lowercase, hyphens, alphanumerics; must start alnum).` }] };
-      }
-      if (!description) return { content: [{ type: "text", text: "Error: description is required (one-line, shown in catalog)." }] };
-      if (!systemPrompt.trim()) return { content: [{ type: "text", text: "Error: systemPrompt is required (the agent's role/prompt)." }] };
-
-      const agentDir = path.join(getAgentDir(), "agents");
-      const filePath = path.join(agentDir, `${name}.md`);
-
-      // Overwrite safety: refuse unless force opt-in (mirrors /subrm's force
-      // pattern — neither silent clobber nor a forced re-prompt).
-      if (fs.existsSync(filePath)) {
-        if (!args.force) {
-          const existing = discoverAgents(ctx.cwd, "user").agents.find((a) => a.name === name);
-          return { content: [{ type: "text", text: `Error: agent "${name}" already exists at ${filePath}.${existing ? ` Description: "${existing.description}".` : ""} Pass force: true to overwrite.` }] };
-        }
-      }
-
-      // Build frontmatter — only emit provided fields. List fields comma-
-      // separated (matches parseListField + the scout.md canonical form).
-      const fm: string[] = [`name: ${name}`, `description: ${description}`];
-      if (args.tools?.length) fm.push(`tools: ${args.tools.join(", ")}`);
-      if (args.disallowedTools?.length) fm.push(`disallowedTools: ${args.disallowedTools.join(", ")}`);
-      if (args.model) fm.push(`model: ${args.model}`);
-      if (args.extensions?.length) fm.push(`extensions: ${args.extensions.join(", ")}`);
-      if (args.skills?.length) fm.push(`skills: ${args.skills.join(", ")}`);
-      if (args.worktree) fm.push(`worktree: true`);
-      const body = `---\n${fm.join("\n")}\n---\n${systemPrompt.replace(/\n$/, "")}\n`;
-
-      try {
-        fs.mkdirSync(agentDir, { recursive: true });
-        fs.writeFileSync(filePath, body, { encoding: "utf-8", mode: 0o600 });
-      } catch (err: any) {
-        return { content: [{ type: "text", text: `Error writing ${filePath}: ${err?.message ?? err}` }] };
-      }
-
-      // Self-verify: re-discover + confirm the file parses + round-trips.
-      const verified = discoverAgents(ctx.cwd, "user").agents.find((a) => a.name === name);
-      if (!verified) {
-        return { content: [{ type: "text", text: `Error: wrote ${filePath} but it did NOT parse / was not discovered. Check the frontmatter syntax.` }] };
-      }
-      const overlay: string[] = [];
-      if (verified.tools?.length) overlay.push(`tools=[${verified.tools.join(",")}]`);
-      if (verified.disallowedTools?.length) overlay.push(`disallowedTools=[${verified.disallowedTools.join(",")}]`);
-      if (verified.model) overlay.push(`model=${verified.model}`);
-      if (verified.extensions?.length) overlay.push(`extensions=[${verified.extensions.join(",")}]`);
-      if (verified.skills?.length) overlay.push(`skills=[${verified.skills.join(",")}]`);
-      if (verified.worktree) overlay.push(`worktree=true`);
-      return { content: [{ type: "text", text: `✓ Agent "${name}" ${fs.existsSync(filePath) && args.force ? "(overwrote)" : ""}written to ${filePath}.\nDiscoverable via subagent_catalog; spawn via /sub ${name} <task> or as a chain step (agent: ${name}).\nParsed back as: description="${verified.description}"${overlay.length ? " · " + overlay.join(" ") : ""}.` }] };
-    },
-  });
-
   // ── orchestrate tool (orchestration, spec §5.2 — Mode 2 LLM trigger) ──
   pi.registerTool({
     name: "orchestrate",
     description:
-      "Run a multi-agent chain in the background (auto-advance, fire-and-forget). The final result is delivered as a follow-up message when the chain completes or halts, so you can continue other work or stop your turn in the meantime. Pass exactly one of: `template` (named chain from ~/.pi/agent/chains/), `steps` (inline LLM-authored step list referencing named agents), or `chains` (run multiple). `template` wins over `steps` if both set. Agents & templates are discoverable via the `subagent_catalog` tool — call it before authoring `steps` or using `template`.",
+      "Run a multi-agent chain in the background (auto-advance, fire-and-forget). The final result is delivered as a follow-up message when the chain completes or halts. Pass exactly one of: `template` (named chain from ~/.pi/agent/chains/*.yaml), `steps` (inline step list referencing named agents), or `chains` (run multiple). `template` wins over `steps` if both set. Named agents live as files at ~/.pi/agent/agents/*.md and chains at ~/.pi/agent/chains/*.yaml — `ls` them before authoring `steps` or using a `template`. Chain steps run fire-and-forget and can't ask mid-run (the `??` answer channel has no route in a pipeline); if a step needs input, spawn it standalone via `subagent_create` instead.",
     parameters: Type.Object({
       template: Type.Optional(
         Type.String({
@@ -899,7 +832,7 @@ Modes (via the 'lite' parameter):
         Type.Array(
           Type.Object({
             agent: Type.String({
-              description: "Name of a defined agent (reference only — discovered via subagent_catalog).",
+              description: "Name of a defined agent (a file under ~/.pi/agent/agents/*.md).",
             }),
             task: Type.String({
               description: "Task for this step. Use {previous} for the prior step's output and {input} for the chain input.",
@@ -1001,12 +934,12 @@ Modes (via the 'lite' parameter):
             return { content: [{ type: "text", text: `Error: ${r.error}` }] };
           resolved.push(r);
         }
-        for (const r of resolved) ids.push(await spawnChain(r.name, r.steps, input, lite, ctx));
+        for (const r of resolved) ids.push(await spawnChain(r.name, r.steps, input, lite, ctx, "agent"));
       } else if (hasTemplate || hasSteps) {
         const r = resolveSpec({ template: args.template, steps: args.steps });
         if ("error" in r)
           return { content: [{ type: "text", text: `Error: ${r.error}` }] };
-        ids.push(await spawnChain(r.name, r.steps, input, lite, ctx));
+        ids.push(await spawnChain(r.name, r.steps, input, lite, ctx, "agent"));
       } else {
         return {
           content: [
@@ -1108,6 +1041,7 @@ Modes (via the 'lite' parameter):
     input: string,
     lite: boolean,
     ctx: any,
+    origin: SubagentOrigin,
   ): Promise<number> {
     // B1: if any referenced agent resolves to a project-scope source, gate it
     // behind an interactive confirm (mirror confirmProjectAgents). Denied → fail
@@ -1127,6 +1061,7 @@ Modes (via the 'lite' parameter):
         const chain: ChainState = {
           id,
           name,
+          origin,
           steps,
           input,
           currentIndex: -1,
@@ -1151,6 +1086,7 @@ Modes (via the 'lite' parameter):
     const chain: ChainState = {
       id,
       name,
+      origin,
       steps,
       input,
       currentIndex: -1,
@@ -1215,6 +1151,15 @@ Modes (via the 'lite' parameter):
     }
     task = task.replaceAll("{input}", chain.input);
     const id = nextId++;
+    const stepAgent = agent.name;
+    const runDir = createRunDir(id, {
+      id,
+      origin: "agent",
+      agent: stepAgent,
+      lite: chain.lite,
+      spawnTime: Date.now(),
+      parentPid: process.pid,
+    });
     const stepState: SubState = {
       id,
       status: "running",
@@ -1222,7 +1167,8 @@ Modes (via the 'lite' parameter):
       events: [],
       toolIndex: new Map(),
       elapsed: 0,
-      sessionFile: makeSessionFile(id),
+      runDir,
+      sessionFile: makeSessionFile(runDir),
       turnCount: 1,
       lite: chain.lite,
       origin: "agent",
@@ -1238,7 +1184,12 @@ Modes (via the 'lite' parameter):
       `[Chain context — your role in this run]\n` +
       `You are step ${i + 1} of ${chain.steps.length} in chain "${chain.name}".\n` +
       `Previous agent: ${prevAgent ?? "none — you are the first step"}.\n` +
-      `Next agent: ${nextAgent ?? "none — you are the final step"}.`;
+      `Next agent: ${nextAgent ?? "none — you are the final step"}.\n\n` +
+      // Q11d: chain steps have no answer route (the coordinator auto-advances;
+      // no main agent in the loop). Reveal WHY (not just forbid) so the model
+      // understands — a yield is semantically undefined here, handled by the
+      // detect-and-fail path in the close handler.
+      `This subagent runs as one step in an automated chain; the "??" answer channel has no route in chains, so proceed through the step without yielding "??".`;
     spawnAgent(
       stepState,
       task,
@@ -1300,10 +1251,17 @@ Modes (via the 'lite' parameter):
       })
       .join(", ");
     const lastAgent = chain.steps[chain.steps.length - 1]?.agent ?? "?";
+    const { body: finalBody, spillPath: finalSpill } = formatResult(
+      finalText,
+      lastState?.runDir ?? runDirPath(chain.subagentIds[chain.subagentIds.length - 1] ?? -1),
+    );
     pi.sendMessage(
       {
         customType: "chain-result",
-        content: `Chain C${chain.id} "${chain.name}" complete (${chain.steps.length}/${chain.steps.length} steps).\nFinal result (${lastAgent}):\n${spillResult(finalText)}\n${perStepWithTools}.${chain.worktree ? `\nWorktree: ${chain.worktree.path} (branch ${chain.worktree.branch}).` : ""}`,
+        content:
+          `Chain C${chain.id} "${chain.name}"${chain.origin === "user" ? " (user-spawned)" : ""} complete (${chain.steps.length}/${chain.steps.length} steps).` +
+          (chain.origin === "user" ? echoUserTask("Input", chain.input) : "") +
+          `\nFinal result (${lastAgent}):\n${finalBody}${finalSpill ? `\nFull result: ${finalSpill}` : ""}\n${perStepWithTools}.${chain.worktree ? `\nWorktree: ${chain.worktree.path} (branch ${chain.worktree.branch}).` : ""}`,
         display: true,
       },
       { deliverAs: "followUp", triggerTurn: true },
@@ -1334,7 +1292,10 @@ Modes (via the 'lite' parameter):
     pi.sendMessage(
       {
         customType: "chain-result",
-        content: `Chain C${chain.id} "${chain.name}" failed at step ${i + 1} (${failedAgent}): ${errorText}${doneNames ? `\nCompleted: ${doneNames}.` : ""}${failedSid !== undefined ? `\nSteps persist for inspection (/subinspect #${failedSid}).` : ""}${chain.worktree ? `\nWorktree: ${chain.worktree.path} (branch ${chain.worktree.branch}).` : ""}`,
+        content:
+          `Chain C${chain.id} "${chain.name}"${chain.origin === "user" ? " (user-spawned)" : ""} failed at step ${i + 1} (${failedAgent}): ${errorText}` +
+          (chain.origin === "user" ? echoUserTask("Input", chain.input) : "") +
+          `${doneNames ? `\nCompleted: ${doneNames}.` : ""}${failedSid !== undefined ? `\nSteps persist for inspection (/subinspect #${failedSid}).` : ""}${chain.worktree ? `\nWorktree: ${chain.worktree.path} (branch ${chain.worktree.branch}).` : ""}`,
         display: true,
       },
       { deliverAs: "followUp", triggerTurn: true },
@@ -1349,7 +1310,7 @@ Modes (via the 'lite' parameter):
     chain.status = "aborted";
     for (const sid of chain.subagentIds) {
       const s = agents.get(sid);
-      if (s?.proc && s.status === "running") s.proc.kill("SIGTERM");
+      if (s?.proc && s.status === "running") terminateProcessGroup(s.proc);
     }
     const doneNames = chain.subagentIds
       .map((sid, idx) =>
@@ -1364,7 +1325,10 @@ Modes (via the 'lite' parameter):
     pi.sendMessage(
       {
         customType: "chain-result",
-        content: `Chain C${chain.id} "${chain.name}" aborted.${doneNames ? ` Completed: ${doneNames}.` : ""}${haltAgent ? ` Halted at: ${haltAgent}.` : ""}`,
+        content:
+          `Chain C${chain.id} "${chain.name}"${chain.origin === "user" ? " (user-spawned)" : ""} aborted.` +
+          (chain.origin === "user" ? echoUserTask("Input", chain.input) : "") +
+          `${doneNames ? ` Completed: ${doneNames}.` : ""}${haltAgent ? ` Halted at: ${haltAgent}.` : ""}`,
         display: true,
       },
       { deliverAs: "followUp", triggerTurn: true },
@@ -1384,7 +1348,7 @@ Modes (via the 'lite' parameter):
     for (const sid of chain.subagentIds) {
       ctx.ui.setWidget(`sub-${sid}`, undefined);
       const s = agents.get(sid);
-      if (s) deleteSessionFile(s);
+      if (s) removeRunDir(s.runDir);
       agents.delete(sid);
     }
     ctx.ui.setWidget(`chain-${chain.id}`, undefined);
@@ -1418,7 +1382,7 @@ Modes (via the 'lite' parameter):
         const s = agents.get(sid);
         if (s) {
           ctx.ui.setWidget(`sub-${sid}`, undefined);
-          deleteSessionFile(s);
+          removeRunDir(s.runDir);
           agents.delete(sid);
         }
         updateWidgets(); // refresh the chain box so the removed step row disappears
@@ -1440,9 +1404,9 @@ Modes (via the 'lite' parameter):
         };
     }
     const wasRunning = !!(state.proc && state.status === "running");
-    if (wasRunning) state.proc.kill("SIGTERM");
+    if (wasRunning) terminateProcessGroup(state.proc);
     ctx.ui.setWidget(`sub-${id}`, undefined);
-    deleteSessionFile(state);
+    removeRunDir(state.runDir);
     cleanupWorktree(state.worktree, true); // §12: explicit /subrm #N force-removes a dirty standalone tree
     agents.delete(id);
     updateWidgets(); // if this was a step of a finished chain, refresh that box
@@ -1489,18 +1453,24 @@ Modes (via the 'lite' parameter):
     return steps;
   }
 
-  /** Combined subagent + chain listing, shared by the `subagent_list` tool and
-   *  `/sublist` command (spec §5.1/§6.2). Extends the existing subagent rows with
-   *  a `(chain Ck)` tag + a Chains section: `Ck "name" · step i/N · agent` +
+  /** Combined subagent + chain listing, shared by the `/sublist` command
+   *  (spec §5.1/§6.2). Extends the existing subagent rows with a
+   *  `(chain Ck)` tag + a Chains section: `Ck "name" · step i/N · agent` +
    *  running/done/error icon. */
   function buildList(ctx: any): string {
     const sections: string[] = [];
     if (agents.size > 0) {
       const list = Array.from(agents.values())
-        .map(
-          (s) =>
-            `#${s.id} [${s.status.toUpperCase()}]${s.lite ? " (lite)" : ""}${s.chainId !== undefined ? ` (chain C${s.chainId})` : ""} (Turn ${s.turnCount}) - ${s.task.length > 60 ? s.task.slice(0, 57) + "..." : s.task}`,
-        )
+        .map((s) => {
+          // Q11: blocked shows "blocked: <pending-question preview>" instead of
+          // the task preview; the [BLOCKED] tag + ⧗ icon both carry the state.
+          if (s.status === "blocked" && s.pendingRequest) {
+            const q = s.pendingRequest.question;
+            const qprev = q.length > 50 ? q.slice(0, 47) + "..." : q;
+            return `#${s.id} [BLOCKED]${s.lite ? " (lite)" : ""}${s.chainId !== undefined ? ` (chain C${s.chainId})` : ""} (Turn ${s.turnCount}) - ${qprev}`;
+          }
+          return `#${s.id} [${s.status.toUpperCase()}]${s.lite ? " (lite)" : ""}${s.chainId !== undefined ? ` (chain C${s.chainId})` : ""} (Turn ${s.turnCount}) - ${s.task.length > 60 ? s.task.slice(0, 57) + "..." : s.task}`;
+        })
         .join("\n");
       sections.push(`Subagents:\n${list}`);
     }
@@ -1551,7 +1521,9 @@ Modes (via the 'lite' parameter):
           ? "●"
           : st.status === "done"
             ? "✓"
-            : "✗";
+            : st.status === "blocked"
+              ? "⧗"
+              : "✗";
       const task = s.task.length > 40 ? s.task.slice(0, 37) + "…" : s.task;
       return `${icon} Step ${i + 1}: ${s.agent} · ${task}`;
     });
@@ -1577,11 +1549,23 @@ Modes (via the 'lite' parameter):
       widgetCtx = ctx;
       const raw = args?.trim();
       if (!raw) {
-        ctx.ui.notify("Usage: /sub <task>  |  /sub <agent> <task>", "error");
+        // Q8: /sub no-arg = the family landing (goal #4's user-side surface).
+        ctx.ui.notify(
+          [
+            "Subagent family:",
+            "  /sub, /sublite — spawn a background subagent",
+            "  /sublist — view running subagents + chains · /subinspect — drill into one",
+            "  /subcont — continue or answer a '??' question · /subrm, /subclear — remove",
+            "  /subchain — run a multi-agent pipeline · /sub doctor — health + sweep dead runs",
+            "",
+            "Spawn: /sub <task>  |  /sub <agent> <task>",
+          ].join("\n"),
+          "info",
+        );
         return;
       }
       // First-token-if-matches: if the first word is a known named agent
-      // (user+project, matching subagent_catalog), treat it as the agent-def
+      // (user+project, matching ~/.pi/agent/agents/*.md), treat it as the agent-def
       // and the remainder as the task. Otherwise the whole string is a bare
       // task (backward compatible). lite is blocked from named agents: an
       // agent's extensions would bypass --no-extensions via explicit -e,
@@ -1606,6 +1590,14 @@ Modes (via the 'lite' parameter):
       }
       const id = nextId++;
       const wt = maybeCreateWorktree(ctx, "pi-sub", id);
+      const runDir = createRunDir(id, {
+        id,
+        origin: "user",
+        agent: agentConfig?.name,
+        lite: false,
+        spawnTime: Date.now(),
+        parentPid: process.pid,
+      });
       const state: SubState = {
         id,
         status: "running",
@@ -1613,7 +1605,8 @@ Modes (via the 'lite' parameter):
         events: [],
         toolIndex: new Map(),
         elapsed: 0,
-        sessionFile: makeSessionFile(id),
+        runDir,
+        sessionFile: makeSessionFile(runDir),
         turnCount: 1,
         lite: false,
         origin: "user",
@@ -1652,6 +1645,13 @@ Modes (via the 'lite' parameter):
       const task = raw;
       const id = nextId++;
       const wt = maybeCreateWorktree(ctx, "pi-sub", id);
+      const runDir = createRunDir(id, {
+        id,
+        origin: "user",
+        lite: true,
+        spawnTime: Date.now(),
+        parentPid: process.pid,
+      });
       const state: SubState = {
         id,
         status: "running",
@@ -1659,7 +1659,8 @@ Modes (via the 'lite' parameter):
         events: [],
         toolIndex: new Map(),
         elapsed: 0,
-        sessionFile: makeSessionFile(id),
+        runDir,
+        sessionFile: makeSessionFile(runDir),
         turnCount: 1,
         lite: true,
         origin: "user",
@@ -1722,6 +1723,7 @@ Modes (via the 'lite' parameter):
       state.status = "running";
       state.task = prompt;
       state.events = [];
+      state.pendingRequest = undefined; // Q4: answer flips blocked->running
       state.toolIndex = new Map();
       state.elapsed = 0;
       state.turnCount++;
@@ -1765,11 +1767,11 @@ Modes (via the 'lite' parameter):
       let killed = 0;
       for (const [id, state] of Array.from(agents.entries())) {
         if (state.proc && state.status === "running") {
-          state.proc.kill("SIGTERM");
+          terminateProcessGroup(state.proc);
           killed++;
         }
         ctx.ui.setWidget(`sub-${id}`, undefined);
-        deleteSessionFile(state);
+        removeRunDir(state.runDir);
         cleanupWorktree(state.worktree); // R3: clean-only — keep dirty + warn
       }
       for (const chain of Array.from(chains.values())) {
@@ -1848,7 +1850,7 @@ Modes (via the 'lite' parameter):
       }
       const options = Array.from(agents.values()).map(
         (s) =>
-          `#${s.id} ${s.status === "running" ? "●" : s.status === "done" ? "✓" : "✗"}${s.lite ? " ⚡" : ""} · ${
+          `#${s.id} ${s.status === "running" ? "●" : s.status === "done" ? "✓" : s.status === "blocked" ? "⧗" : "✗"}${s.lite ? " ⚡" : ""} · ${
             s.task.length > 40 ? s.task.slice(0, 37) + "…" : s.task
           }`,
       );
@@ -1906,7 +1908,7 @@ Modes (via the 'lite' parameter):
         const idx = options.indexOf(choice);
         const tmpl = idx >= 0 ? list[idx] : undefined;
         if (!tmpl) return;
-        const id = await spawnChain(tmpl.name, tmpl.steps, "", false, ctx);
+        const id = await spawnChain(tmpl.name, tmpl.steps, "", false, ctx, "user");
         ctx.ui.notify(
           `Chain C${id} "${tmpl.name}" started (${tmpl.steps.length} steps).`,
           "info",
@@ -1920,7 +1922,7 @@ Modes (via the 'lite' parameter):
           ctx.ui.notify(parsed.error, "error");
           return;
         }
-        const id = await spawnChain("inline", parsed, "", false, ctx);
+        const id = await spawnChain("inline", parsed, "", false, ctx, "user");
         ctx.ui.notify(
           `Chain C${id} (inline) started (${parsed.length} steps).`,
           "info",
@@ -1942,7 +1944,7 @@ Modes (via the 'lite' parameter):
         );
         return;
       }
-      const id = await spawnChain(tmpl.name, tmpl.steps, input, false, ctx);
+      const id = await spawnChain(tmpl.name, tmpl.steps, input, false, ctx, "user");
       ctx.ui.notify(
         `Chain C${id} "${tmpl.name}" started (${tmpl.steps.length} steps).`,
         "info",
@@ -1950,12 +1952,45 @@ Modes (via the 'lite' parameter):
     },
   });
 
-  // ── /subchain-doctor (read-only diagnostics, spec §6.2/§9 item 9) ────────
-  pi.registerCommand("subchain-doctor", {
+  // ── /sub doctor (on-demand sweep + absorbed config diagnostics, Q8) ──────
+  // Two jobs: (1) run the Q9 orphan sweep (report reaped) + scan in-session
+  // zombie RunDirs (worker gone, parent alive, dir not tracked — report only,
+  // let the user /subrm deliberately); (2) the old /subchain-doctor config
+  // diagnostics (resolved dirs, discovery counts, sample agent, extension
+  // survival). /subchain-doctor is retired (no alias — refactor-in-place).
+  pi.registerCommand("sub doctor", {
     description:
-      "Read-only diagnostics: resolved agent/chain dirs, discovery counts, sample agent, extensions survival",
+      "Health check: sweep orphaned runs + report in-session zombies + show agent/chain discovery + extension survival",
     handler: async (_args, ctx) => {
       widgetCtx = ctx;
+      const lines: string[] = ["Subagent-widget doctor"];
+      // (1) Orphan sweep: reap runs whose spawning pi (parentPid) is dead.
+      const reaped = sweepRuns();
+      lines.push(`Runs dir:          ${RUNS_DIR}`);
+      lines.push(
+        `Orphan sweep:      ${reaped.length === 0 ? "no orphaned runs" : `reaped ${reaped.length} (${reaped.map((n) => "#" + n).join(", ")})`}`,
+      );
+      // In-session zombies: runDirs whose parent is alive but which aren't
+      // tracked in the in-memory agents map (worker exited, dir remains).
+      // Reported, not reaped — Q9 doctor-feature, not a sweep rule.
+      const zombies: string[] = [];
+      try {
+        for (const name of fs.readdirSync(RUNS_DIR)) {
+          if (!/^\d+$/.test(name)) continue;
+          const dir = path.join(RUNS_DIR, name);
+          const meta = readMeta(dir);
+          if (!meta) {
+            zombies.push(`runs/${name} (no meta)`);
+            continue;
+          }
+          if (isPidAlive(meta.parentPid) && !agents.has(meta.id))
+            zombies.push(`runs/${name}`);
+        }
+      } catch {}
+      lines.push(
+        `In-session zombies: ${zombies.length === 0 ? "none" : `${zombies.length} (${zombies.join(", ")}) — /subrm <id> to reap`}`,
+      );
+      // (2) Absorbed /subchain-doctor config diagnostics.
       const agentRoot = getAgentDir();
       const agentDir = path.join(agentRoot, "agents");
       const chainDir = path.join(agentRoot, "chains");
@@ -1965,32 +2000,31 @@ Modes (via the 'lite' parameter):
       const projAgents = agBoth.agents.filter((a) => a.source === "project");
       const userChains = chBoth.chains.filter((c) => c.source === "user");
       const projChains = chBoth.chains.filter((c) => c.source === "project");
-      const lines: string[] = ["Subagent-widget doctor"];
-      lines.push(`Agent dir:        ${agentDir} (${userAgents.length} user)`);
+      lines.push(`Agent dir:         ${agentDir} (${userAgents.length} user)`);
       if (agBoth.projectAgentsDir)
         lines.push(`Project agent dir: ${agBoth.projectAgentsDir} (${projAgents.length} project)`);
-      lines.push(`Chain dir:        ${chainDir} (${userChains.length} user)`);
+      lines.push(`Chain dir:         ${chainDir} (${userChains.length} user)`);
       if (chBoth.projectChainsDir)
         lines.push(`Project chain dir: ${chBoth.projectChainsDir} (${projChains.length} project)`);
       const sample = agBoth.agents[0];
       if (sample) {
-        lines.push(`Sample agent:     ${sample.name} — ${sample.description}`);
+        lines.push(`Sample agent:      ${sample.name} — ${sample.description}`);
         const modelDisplay = !sample.model || sample.model === "default" ? "(default)" : sample.model;
         lines.push(`  tools=${sample.tools?.join(",") ?? "(default)"} model=${modelDisplay}`);
         lines.push(`  extensions=${sample.extensions?.join(",") ?? "(none additive)"} skills=${sample.skills?.join(",") ?? "(none)"} disallowedTools=${sample.disallowedTools?.join(",") ?? "(none)"}`);
       } else {
-        lines.push("Sample agent:     (none defined — create *.md in the agent dir)");
+        lines.push("Sample agent:      (none defined — create *.md in the agent dir)");
       }
       const liteExts = loadLiteExtensions();
-      lines.push(`Lite spawn:       --no-extensions ${liteExts.map((e) => `-e ${e}`).join(" ") || "(empty!)"}`);
+      lines.push(`Lite spawn:        --no-extensions ${liteExts.map((e) => `-e ${e}`).join(" ") || "(empty!)"}`);
       const disallow = loadDisallowedExtensions();
       const survivors = resolveFullModeExtArgs(ctx.cwd);
       if (survivors === null) {
-        lines.push(`Full spawn:       discovery unrestricted (disallowedExt ${disallow.length ? `[${disallow.join(",")}] matched nothing` : "empty"})`);
+        lines.push(`Full spawn:        discovery unrestricted (disallowedExt ${disallow.length ? `[${disallow.join(",")}] matched nothing` : "empty"})`);
       } else {
         const target = normalizeForMatch("npm:pi-neuralwatt-provider");
         const hasNeuralwatt = survivors.some((s) => normalizeForMatch(s) === target);
-        lines.push(`Full spawn:       --no-extensions -e [${survivors.length} survivors] — neuralwatt ${hasNeuralwatt ? "✓ present" : "✗ MISSING"}`);
+        lines.push(`Full spawn:        --no-extensions -e [${survivors.length} survivors] — neuralwatt ${hasNeuralwatt ? "✓ present" : "✗ MISSING"}`);
       }
       ctx.ui.notify(lines.join("\n"), "info");
     },
@@ -2000,10 +2034,10 @@ Modes (via the 'lite' parameter):
   pi.on("session_start", async (_event, ctx) => {
     for (const [id, state] of Array.from(agents.entries())) {
       if (state.proc && state.status === "running") {
-        state.proc.kill("SIGTERM");
+        terminateProcessGroup(state.proc);
       }
       ctx.ui.setWidget(`sub-${id}`, undefined);
-      deleteSessionFile(state);
+      removeRunDir(state.runDir);
       cleanupWorktree(state.worktree); // R3: clean slate for widgets/id — but clean-only so a dirty tree is KEPT + warned, not force-destroyed (force is for /subrm)
     }
     for (const chain of Array.from(chains.values())) {
@@ -2015,5 +2049,10 @@ Modes (via the 'lite' parameter):
     chains.clear();
     nextChainId = 1;
     widgetCtx = ctx;
+    // Q9: reap runs orphaned by a prior-session pi (crash, kill, abandoned
+    // blocked). Fires at the natural lifecycle boundary (restart = new
+    // session_start) so orphans are swept immediately, not "one session later".
+    // Silent — a count is reported on demand via /sub doctor (step 7).
+    sweepRuns();
   });
 }

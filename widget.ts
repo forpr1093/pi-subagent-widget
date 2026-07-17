@@ -57,13 +57,17 @@ export function buildSubagentWidget(
             ? "accent"
             : state.status === "done"
               ? "success"
-              : "error";
+              : state.status === "blocked"
+                ? "warning"
+                : "error";
         const statusIcon =
           state.status === "running"
             ? "●"
             : state.status === "done"
               ? "✓"
-              : "✗";
+              : state.status === "blocked"
+                ? "⧗"
+                : "✗";
         const taskPreview =
           state.task.length > 40 ? state.task.slice(0, 37) + "..." : state.task;
         // Lite subagents get a high-visibility yellow ⚡ badge so they stand out
@@ -206,6 +210,8 @@ export function buildChainWidget(
             lines.push(theme.fg("accent", "  ●") + meta);
           } else if (st.status === "done") {
             lines.push(theme.fg("success", "  ✓") + meta);
+          } else if (st.status === "blocked") {
+            lines.push(theme.fg("warning", "  ⧗") + meta);
           } else {
             lines.push(theme.fg("error", "  ✗") + meta);
           }
