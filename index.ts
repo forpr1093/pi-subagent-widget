@@ -100,6 +100,22 @@ function formatResult(text: string, runDir: string): { body: string; spillPath?:
   }
 }
 
+/** Echo the user's original task/input into a follow-up header so the main
+ *  agent knows WHAT the user asked (it has no other way to know for a
+ *  user-spawned subagent/chain — agent-origin keeps the bare header since the
+ *  agent already knows the task it assigned). Q7 trimmed the prompt echo for
+ *  general brevity; this re-adds it narrowly for user-origin only. Returns ""
+ *  when `task` is empty (e.g. an inline chain with no {input}). */
+const USER_TASK_CAP = 300;
+function echoUserTask(label: string, task: string): string {
+  const t = task.trim().replace(/\s+/g, " ");
+  if (!t) return "";
+  const truncated = t.length > USER_TASK_CAP
+    ? t.slice(0, USER_TASK_CAP) + "… (full task in prompt.md)"
+    : t;
+  return `\n${label}: ${truncated}`;
+}
+
 /** Parse a target ID shared by the remove/inspect tools + slash commands (spec
  *  §5.1/§6.2). Accepts: a number (`2` → subagent #2), `"2"`/`"#2"` (subagent),
  *  `"C1"`/`"c2"` (whole chain), `"C1@3"` (chain step 3, 1-based). */
@@ -500,7 +516,10 @@ export default function (pi: ExtensionAPI) {
             pi.sendMessage(
               {
                 customType: "subagent-request",
-                content: `[Subagent #${state.id}] blocked, asking:\n${question}`,
+                content:
+                  `[Subagent #${state.id}${state.origin === "user" ? " · user-spawned" : ""}] blocked, asking:` +
+                  (state.origin === "user" ? echoUserTask("Task", state.task) : "") +
+                  `\n${question}`,
                 display: true,
               },
               { deliverAs: "followUp", triggerTurn: true },
@@ -545,8 +564,9 @@ export default function (pi: ExtensionAPI) {
               {
                 customType: "subagent-result",
                 content:
-                  `[Subagent #${state.id}${state.lite ? " ⚡lite" : ""}] finished in ${Math.round(state.elapsed / 1000)}s.\n` +
-                  `${body || "(no text output)"}` +
+                  `[Subagent #${state.id}${state.lite ? " ⚡lite" : ""}${state.origin === "user" ? " · user-spawned" : ""}] finished in ${Math.round(state.elapsed / 1000)}s.` +
+                  (state.origin === "user" ? echoUserTask("Task", state.task) : "") +
+                  `\n${body || "(no text output)"}` +
                   (spillPath ? `\nFull result: ${spillPath}` : ""),
                 display: true,
               },
@@ -914,12 +934,12 @@ Optional \`agent\` runs the subagent under a named agent's role (its system prom
             return { content: [{ type: "text", text: `Error: ${r.error}` }] };
           resolved.push(r);
         }
-        for (const r of resolved) ids.push(await spawnChain(r.name, r.steps, input, lite, ctx));
+        for (const r of resolved) ids.push(await spawnChain(r.name, r.steps, input, lite, ctx, "agent"));
       } else if (hasTemplate || hasSteps) {
         const r = resolveSpec({ template: args.template, steps: args.steps });
         if ("error" in r)
           return { content: [{ type: "text", text: `Error: ${r.error}` }] };
-        ids.push(await spawnChain(r.name, r.steps, input, lite, ctx));
+        ids.push(await spawnChain(r.name, r.steps, input, lite, ctx, "agent"));
       } else {
         return {
           content: [
@@ -1021,6 +1041,7 @@ Optional \`agent\` runs the subagent under a named agent's role (its system prom
     input: string,
     lite: boolean,
     ctx: any,
+    origin: SubagentOrigin,
   ): Promise<number> {
     // B1: if any referenced agent resolves to a project-scope source, gate it
     // behind an interactive confirm (mirror confirmProjectAgents). Denied → fail
@@ -1040,6 +1061,7 @@ Optional \`agent\` runs the subagent under a named agent's role (its system prom
         const chain: ChainState = {
           id,
           name,
+          origin,
           steps,
           input,
           currentIndex: -1,
@@ -1064,6 +1086,7 @@ Optional \`agent\` runs the subagent under a named agent's role (its system prom
     const chain: ChainState = {
       id,
       name,
+      origin,
       steps,
       input,
       currentIndex: -1,
@@ -1235,7 +1258,10 @@ Optional \`agent\` runs the subagent under a named agent's role (its system prom
     pi.sendMessage(
       {
         customType: "chain-result",
-        content: `Chain C${chain.id} "${chain.name}" complete (${chain.steps.length}/${chain.steps.length} steps).\nFinal result (${lastAgent}):\n${finalBody}${finalSpill ? `\nFull result: ${finalSpill}` : ""}\n${perStepWithTools}.${chain.worktree ? `\nWorktree: ${chain.worktree.path} (branch ${chain.worktree.branch}).` : ""}`,
+        content:
+          `Chain C${chain.id} "${chain.name}"${chain.origin === "user" ? " (user-spawned)" : ""} complete (${chain.steps.length}/${chain.steps.length} steps).` +
+          (chain.origin === "user" ? echoUserTask("Input", chain.input) : "") +
+          `\nFinal result (${lastAgent}):\n${finalBody}${finalSpill ? `\nFull result: ${finalSpill}` : ""}\n${perStepWithTools}.${chain.worktree ? `\nWorktree: ${chain.worktree.path} (branch ${chain.worktree.branch}).` : ""}`,
         display: true,
       },
       { deliverAs: "followUp", triggerTurn: true },
@@ -1266,7 +1292,10 @@ Optional \`agent\` runs the subagent under a named agent's role (its system prom
     pi.sendMessage(
       {
         customType: "chain-result",
-        content: `Chain C${chain.id} "${chain.name}" failed at step ${i + 1} (${failedAgent}): ${errorText}${doneNames ? `\nCompleted: ${doneNames}.` : ""}${failedSid !== undefined ? `\nSteps persist for inspection (/subinspect #${failedSid}).` : ""}${chain.worktree ? `\nWorktree: ${chain.worktree.path} (branch ${chain.worktree.branch}).` : ""}`,
+        content:
+          `Chain C${chain.id} "${chain.name}"${chain.origin === "user" ? " (user-spawned)" : ""} failed at step ${i + 1} (${failedAgent}): ${errorText}` +
+          (chain.origin === "user" ? echoUserTask("Input", chain.input) : "") +
+          `${doneNames ? `\nCompleted: ${doneNames}.` : ""}${failedSid !== undefined ? `\nSteps persist for inspection (/subinspect #${failedSid}).` : ""}${chain.worktree ? `\nWorktree: ${chain.worktree.path} (branch ${chain.worktree.branch}).` : ""}`,
         display: true,
       },
       { deliverAs: "followUp", triggerTurn: true },
@@ -1296,7 +1325,10 @@ Optional \`agent\` runs the subagent under a named agent's role (its system prom
     pi.sendMessage(
       {
         customType: "chain-result",
-        content: `Chain C${chain.id} "${chain.name}" aborted.${doneNames ? ` Completed: ${doneNames}.` : ""}${haltAgent ? ` Halted at: ${haltAgent}.` : ""}`,
+        content:
+          `Chain C${chain.id} "${chain.name}"${chain.origin === "user" ? " (user-spawned)" : ""} aborted.` +
+          (chain.origin === "user" ? echoUserTask("Input", chain.input) : "") +
+          `${doneNames ? ` Completed: ${doneNames}.` : ""}${haltAgent ? ` Halted at: ${haltAgent}.` : ""}`,
         display: true,
       },
       { deliverAs: "followUp", triggerTurn: true },
@@ -1876,7 +1908,7 @@ Optional \`agent\` runs the subagent under a named agent's role (its system prom
         const idx = options.indexOf(choice);
         const tmpl = idx >= 0 ? list[idx] : undefined;
         if (!tmpl) return;
-        const id = await spawnChain(tmpl.name, tmpl.steps, "", false, ctx);
+        const id = await spawnChain(tmpl.name, tmpl.steps, "", false, ctx, "user");
         ctx.ui.notify(
           `Chain C${id} "${tmpl.name}" started (${tmpl.steps.length} steps).`,
           "info",
@@ -1890,7 +1922,7 @@ Optional \`agent\` runs the subagent under a named agent's role (its system prom
           ctx.ui.notify(parsed.error, "error");
           return;
         }
-        const id = await spawnChain("inline", parsed, "", false, ctx);
+        const id = await spawnChain("inline", parsed, "", false, ctx, "user");
         ctx.ui.notify(
           `Chain C${id} (inline) started (${parsed.length} steps).`,
           "info",
@@ -1912,7 +1944,7 @@ Optional \`agent\` runs the subagent under a named agent's role (its system prom
         );
         return;
       }
-      const id = await spawnChain(tmpl.name, tmpl.steps, input, false, ctx);
+      const id = await spawnChain(tmpl.name, tmpl.steps, input, false, ctx, "user");
       ctx.ui.notify(
         `Chain C${id} "${tmpl.name}" started (${tmpl.steps.length} steps).`,
         "info",

@@ -63,6 +63,7 @@ export interface SubState {
 export interface ChainState {
   id: number; // C1, C2, …
   name: string; // template name, or "inline" for /subchain CLI-compose
+  origin: SubagentOrigin; // who started this chain: "user" (/subchain) or "agent" (orchestrate tool)
   steps: ChainStepDef[]; // resolved references (agent names + tasks)
   input: string; // {input} substitution value
   currentIndex: number; // 0-based; -1 = not started
