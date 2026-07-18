@@ -98,25 +98,36 @@ orphan-reaper** lifecycle. Current surface: **4 LLM tools + 9 slash commands.**
 ### `SubState` (one per subagent, in `agents: Map<id, SubState>`)
 
 ```
-                  spawnAgent()
-   (nothing) ─────────────────► pending
-                                  │ proc.on("spawn")
-                                  ▼
-                                running ──────────► blocked   (yielded `??`; spec §Q4)
-                                  │   ▲                │
-                                  │   └────────────────┘ /subcont answer (re-spawn
-                                  │                          with the session file,
-                                  │                          preserves mode → back to running)
-                                  │ proc.on("close")
-                                  ├─ exit 0     → done
-                                  ├─ exit non-0 → error
-                                  └─ was removed mid-run    → (silently dropped, no followUp)
-                                                       │
-                                  any terminal state ─┤
-                                  + reap at           │ /subrm #N or session_start sweep
-                                  next session_start  ▼
-                                                   (RunDir removed, SubState pruned)
+              spawnAgent() constructs SubState
+              directly with status="running":
+   (nothing) ──────────────────────► running ──────────► blocked   (yielded `??`; spec §Q4)
+                                       │   ▲                │
+                                       │   └────────────────┘ /subcont answer (re-spawn
+                                       │                          with the session file,
+                                       │                          preserves mode → back to running)
+                                       │ proc.on("close")
+                                       ├─ exit 0     → done
+                                       ├─ exit non-0 → error
+                                       └─ was removed mid-run    → (silently dropped, no followUp)
+                                                            │
+                                       any terminal state ─┤
+                                       + reap at           │ /subrm #N or session_start sweep
+                                       next session_start  ▼
+                                                        (RunDir removed, SubState pruned)
 ```
+
+**Type-level status enum** (from `types.ts`):
+`SubState.status: "running" | "done" | "error" | "blocked"` — exactly four values, no
+`pending`. The `SubState` is born `running` at construction. There are **2 real
+construction sites** in `index.ts`: `spawnAgent()` (which all entrypoints —
+`subagent_create` tool, `/sub` + `/sublite` commands, `subagent_continue` tool +
+command — funnel through) and `spawnStep()` (chain steps). Two additional
+`SubState` literals in `openChainInspector()` are **synthetic display records**
+(reconstructing a SubState for read-only inspection when the real one has been
+pruned from the `agents` map), not real spawns — they also start at `running`.
+There is no `proc.on("spawn")` transition and no observable pre-spawn status —
+the widget first renders after `spawnAgent` returns, by which point the process
+is already spawning.
 
 Status glyph legend (widget): `●` running · `⧗` blocked · `✓` done · `✗` error.
 
